@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+rag_eval_project_v2/.venv/
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+rag_eval_project_v2/.pytest_cache/
+
+# Local logs/temp
+*.log
+*.tmp
+*.bak
+
+# Project-generated artifacts
+blueprint_extracted.txt
+rag_eval_project_v2/outputs/
+rag_eval_project_v2/data/web_cache/
+rag_eval_project_v2/config/best_config.yaml
+rag_eval_project_v2/data/questions/train_questions.xlsx
+rag_eval_project_v2/data/questions/test_questions.xlsx
+
