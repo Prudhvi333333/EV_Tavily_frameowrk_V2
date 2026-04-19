@@ -5,16 +5,27 @@ from typing import Any
 
 import numpy as np
 
-from src.generator import OllamaGenerator
+from src.generator import OllamaGenerator, OpenRouterGenerator
 
 
 class ScoreValidator:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         validator_cfg = config.get("evaluation", {}).get("validator", {})
+        self.provider = str(validator_cfg.get("provider", "ollama")).lower()
         self.model = validator_cfg.get("model", "qwen2.5:14b")
+        self.base_url = str(validator_cfg.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/")
+        self.api_key_env = str(validator_cfg.get("api_key_env", "OPENROUTER_API_KEY"))
         self.flag_threshold = float(validator_cfg.get("flag_threshold", 0.3))
-        self.local_qwen = OllamaGenerator(self.model)
+        if self.provider in {"openrouter", "kimi_cloud", "kimi"}:
+            self.local_qwen = OpenRouterGenerator(
+                self.model,
+                api_key_env=self.api_key_env,
+                base_url=self.base_url,
+                strict=bool(config.get("runtime", {}).get("strict_mode", False)),
+            )
+        else:
+            self.local_qwen = OllamaGenerator(self.model, strict=bool(config.get("runtime", {}).get("strict_mode", False)))
         eval_cfg = config.get("evaluation", {})
         self.weight_sets = {
             "rag": eval_cfg.get("weights_rag", {}),
@@ -145,4 +156,3 @@ class ScoreValidator:
         if p + r == 0:
             return 0.0
         return round((2 * p * r) / (p + r), 4)
-

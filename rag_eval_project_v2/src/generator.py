@@ -119,6 +119,57 @@ class GeminiGenerator:
             return ""
 
 
+class OpenRouterGenerator:
+    def __init__(
+        self,
+        model: str,
+        api_key_env: str = "OPENROUTER_API_KEY",
+        base_url: str | None = None,
+        timeout: float = 120.0,
+        strict: bool = True,
+    ) -> None:
+        self.model = model
+        self.api_key_env = api_key_env
+        self.base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        self.timeout = timeout
+        self.strict = strict
+        self.api_key = os.getenv(api_key_env, "").strip()
+
+    async def generate(self, prompt: str, system: str = "", temperature: float = 0.1) -> str:
+        if not self.api_key:
+            if self.strict:
+                raise RuntimeError(f"{self.api_key_env} is not set for OpenRouter usage.")
+            return ""
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system or "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+            return (
+                resp.json()
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+        except Exception as e:
+            if self.strict:
+                raise RuntimeError(f"OpenRouter generation failed for model '{self.model}'.") from e
+            return ""
+
+
 def build_prompt(
     question: str,
     mode: PipelineMode,

@@ -67,8 +67,8 @@ hyde:
 crawler:
   timeout_per_url: 30
   total_timeout: 240
-  max_urls: 3
-  top_results: 2
+  max_urls: 5
+  top_results: 3
   cache_enabled: true
   search_provider: tavily
   crawl_provider: firecrawl
@@ -76,9 +76,17 @@ crawler:
   firecrawl_api_key_env: FIRECRAWL_API_KEY
 
 web_validator:
-  threshold: 0.60
-  low_confidence_floor: 0.55
-  llm_min_score: 0.20
+  threshold: 0.58
+  low_confidence_floor: 0.50
+  llm_min_score: 0.12
+  partial_relevance_floor: 0.20
+  partial_semantic_override_min: 0.72
+  partial_keyword_override_min: 0.45
+  judge:
+    provider: ollama
+    model: qwen2.5:14b
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
   signal_weights:
     - 0.40
     - 0.35
@@ -127,7 +135,10 @@ evaluation:
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
   validator:
+    provider: ollama
     model: qwen2.5:14b
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
     flag_threshold: 0.3
   weights_rag:
     faithfulness: 0.25

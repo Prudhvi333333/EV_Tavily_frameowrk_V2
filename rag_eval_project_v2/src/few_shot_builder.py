@@ -23,15 +23,22 @@ class FewShotBuilder:
             return ""
         query_vec = self.embedder.encode([question], normalize_embeddings=True)
         sims = cosine_similarity(query_vec, self.train_vectors)[0]
-        idxs = np.argsort(sims)[::-1][:n]
+        q_norm = " ".join(question.casefold().split())
+        ranked = np.argsort(sims)[::-1].tolist()
         blocks: list[str] = []
-        for i, idx in enumerate(idxs, start=1):
+        counter = 1
+        for idx in ranked:
+            if counter > n:
+                break
             row = self.train_df.iloc[int(idx)]
             q = str(row["Question"])
+            if " ".join(q.casefold().split()) == q_norm:
+                continue
             a = str(row["Human validated answers"])
             if pipeline_mode in {"rag", "rag_pretrained", "rag_pretrained_web"}:
                 a = self._format_rag_template(a)
-            blocks.append(f"Example {i}:\nQuestion: {q}\nAnswer: {a}")
+            blocks.append(f"Example {counter}:\nQuestion: {q}\nAnswer: {a}")
+            counter += 1
         return "\n\n".join(blocks)
 
     def format_for_list_question(self, example: dict[str, str]) -> str:

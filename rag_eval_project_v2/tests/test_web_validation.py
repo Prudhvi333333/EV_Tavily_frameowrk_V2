@@ -37,9 +37,10 @@ def test_score_domain_keywords_respects_tier_logic() -> None:
 
 
 def test_parse_judge_response_strict_json() -> None:
-    response = '{"score": 8, "reason": "Clearly focused on Georgia EV supply chain."}'
-    score, reason = parse_judge_response(response, strict_mode=True)
+    response = '{"score": 8, "partial_relevance": 0.7, "reason": "Clearly focused on Georgia EV supply chain."}'
+    score, partial, reason = parse_judge_response(response, strict_mode=True)
     assert score == 0.8
+    assert partial == 0.7
     assert "Georgia EV supply chain" in reason
 
 
@@ -114,3 +115,38 @@ def test_document_validator_rejects_when_llm_signal_is_too_low() -> None:
     )
     assert result.accepted is False
     assert "llm_relevance" in result.decision
+
+
+def test_document_validator_accepts_partial_relevance_override() -> None:
+    cfg = {
+        "runtime": {"strict_mode": True},
+        "web_validator": {
+            "threshold": 0.60,
+            "low_confidence_floor": 0.50,
+            "llm_min_score": 0.12,
+            "partial_relevance_floor": 0.20,
+            "partial_semantic_override_min": 0.72,
+            "partial_keyword_override_min": 0.45,
+            "signal_weights": [0.40, 0.35, 0.25],
+            "domain_keywords": {
+                "tier1": ["electric vehicle", "battery cell", "supply chain", "tier 1"],
+                "tier2": ["automotive", "georgia", "facility"],
+            },
+        },
+    }
+    validator = DocumentValidator(
+        config=cfg,
+        kb_centroid_validator=_FakeCentroidValidator(0.90),
+        qwen_generator=_FakeQwen('{"score": 1, "partial_relevance": 0.25, "reason": "Partly useful."}'),
+        logger=None,
+    )
+    result = asyncio.run(
+        validator.validate(
+            text="Georgia electric vehicle battery cell supply chain facility update.",
+            url="https://example.com/partial",
+            question="Which Georgia EV battery companies are involved?",
+        )
+    )
+    assert result.accepted is True
+    assert result.low_confidence is True
+    assert result.s3_partial_relevance >= 0.20

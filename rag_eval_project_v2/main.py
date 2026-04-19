@@ -16,7 +16,7 @@ from src.generator import ModelGenerator, PipelineMode
 from src.hyde import HyDEExpander
 from src.indexer import build_or_load_index
 from src.kb_loader import load_kb
-from src.reporter import build_comparison_report, build_report, build_reviewer_dashboard
+from src.reporter import build_comparison_report, build_report
 from src.retriever import HybridRetriever
 from src.score_validator import ScoreValidator
 from src.splitter import load_split
@@ -31,6 +31,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--models", nargs="*", default=None, help="Subset of model keys to run")
     parser.add_argument("--pipelines", nargs="*", default=None, help="Subset of pipelines to run")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit of test questions")
+    parser.add_argument(
+        "--eval-split",
+        choices=["test", "train", "both"],
+        default="test",
+        help="Which split to evaluate.",
+    )
+    parser.add_argument(
+        "--use-kimi-cloud-judge",
+        action="store_true",
+        help="Use OpenRouter Kimi Cloud as evaluator + web validator judge.",
+    )
+    parser.add_argument("--judge-provider", default=None, help="Override evaluation judge provider.")
+    parser.add_argument("--judge-model", default=None, help="Override evaluation judge model.")
+    parser.add_argument("--web-judge-provider", default=None, help="Override web validator judge provider.")
+    parser.add_argument("--web-judge-model", default=None, help="Override web validator judge model.")
     return parser.parse_args()
 
 
@@ -160,9 +175,42 @@ async def main() -> None:
     config = load_config(args.config)
     logger = get_logger("main", config)
 
+    if args.use_kimi_cloud_judge:
+        config.setdefault("evaluation", {}).setdefault("judge", {})
+        config["evaluation"]["judge"]["provider"] = "openrouter"
+        config["evaluation"]["judge"]["model"] = "kimi-k2.5:cloud"
+        config.setdefault("web_validator", {}).setdefault("judge", {})
+        config["web_validator"]["judge"]["provider"] = "openrouter"
+        config["web_validator"]["judge"]["model"] = "kimi-k2.5:cloud"
+    if args.judge_provider:
+        config.setdefault("evaluation", {}).setdefault("judge", {})
+        config["evaluation"]["judge"]["provider"] = args.judge_provider
+    if args.judge_model:
+        config.setdefault("evaluation", {}).setdefault("judge", {})
+        config["evaluation"]["judge"]["model"] = args.judge_model
+    if args.web_judge_provider:
+        config.setdefault("web_validator", {}).setdefault("judge", {})
+        config["web_validator"]["judge"]["provider"] = args.web_judge_provider
+    if args.web_judge_model:
+        config.setdefault("web_validator", {}).setdefault("judge", {})
+        config["web_validator"]["judge"]["model"] = args.web_judge_model
+    logger.info(
+        "Judge config | evaluation: %s/%s | web_validator: %s/%s",
+        config.get("evaluation", {}).get("judge", {}).get("provider", "ollama"),
+        config.get("evaluation", {}).get("judge", {}).get("model", "qwen2.5:14b"),
+        config.get("web_validator", {}).get("judge", {}).get("provider", "ollama"),
+        config.get("web_validator", {}).get("judge", {}).get("model", config.get("hyde", {}).get("model", "qwen2.5:14b")),
+    )
+
     train_df, test_df = load_split(config)
+    split_frames: dict[str, pd.DataFrame] = {"train": train_df.copy(), "test": test_df.copy()}
+    if args.eval_split == "both":
+        selected_splits = ["train", "test"]
+    else:
+        selected_splits = [args.eval_split]
     if args.limit:
-        test_df = test_df.head(args.limit).copy()
+        for split_name in selected_splits:
+            split_frames[split_name] = split_frames[split_name].head(args.limit).copy()
         logger.info("Applying --limit=%s for quick run.", args.limit)
 
     kb_docs = load_kb(config)
@@ -179,51 +227,49 @@ async def main() -> None:
     all_results: dict[tuple[str, str], list[dict[str, Any]]] = {}
     progress: list[dict[str, Any]] = []
 
-    for model_key in selected_models:
-        for pipeline_mode in selected_pipelines:
-            logger.info("Running model=%s pipeline=%s", model_key, pipeline_mode.value)
-            generated = await run_single_pipeline(
-                model_key=model_key,
-                pipeline_mode=pipeline_mode,
-                config=config,
-                retriever=retriever,
-                crawler=crawler,
-                questions_df=test_df,
-                few_shot_builder=few_shot_builder,
-            )
-            evaluated = await evaluator.evaluate_all(generated, pipeline_mode.value)
-            validated = await validator.validate_all(evaluated, pipeline_mode.value)
-            report_path = build_report(validated, model_key, pipeline_mode.value, config)
-            all_results[(model_key, pipeline_mode.value)] = validated
+    for split_name in selected_splits:
+        questions_df = split_frames[split_name]
+        for model_key in selected_models:
+            for pipeline_mode in selected_pipelines:
+                logger.info("Running split=%s model=%s pipeline=%s", split_name, model_key, pipeline_mode.value)
+                generated = await run_single_pipeline(
+                    model_key=model_key,
+                    pipeline_mode=pipeline_mode,
+                    config=config,
+                    retriever=retriever,
+                    crawler=crawler,
+                    questions_df=questions_df,
+                    few_shot_builder=few_shot_builder,
+                )
+                evaluated = await evaluator.evaluate_all(generated, pipeline_mode.value)
+                validated = await validator.validate_all(evaluated, pipeline_mode.value)
+                report_model_name = model_key if split_name == "test" else f"{model_key}_{split_name}"
+                report_path = build_report(validated, report_model_name, pipeline_mode.value, config)
+                all_results[(report_model_name, pipeline_mode.value)] = validated
 
-            run_score = round(sum(r.get("final_score", 0.0) for r in validated) / max(len(validated), 1), 4)
-            progress.append(
-                {
-                    "model": model_key,
-                    "pipeline": pipeline_mode.value,
-                    "questions": len(validated),
-                    "mean_final_score": run_score,
-                    "report": report_path,
-                }
-            )
-            logger.info(
-                "Completed model=%s pipeline=%s mean_final_score=%.4f report=%s",
-                model_key,
-                pipeline_mode.value,
-                run_score,
-                report_path,
-            )
+                run_score = round(sum(r.get("final_score", 0.0) for r in validated) / max(len(validated), 1), 4)
+                progress.append(
+                    {
+                        "split": split_name,
+                        "model": model_key,
+                        "pipeline": pipeline_mode.value,
+                        "questions": len(validated),
+                        "mean_final_score": run_score,
+                        "report": report_path,
+                    }
+                )
+                logger.info(
+                    "Completed split=%s model=%s pipeline=%s mean_final_score=%.4f report=%s",
+                    split_name,
+                    model_key,
+                    pipeline_mode.value,
+                    run_score,
+                    report_path,
+                )
 
     comparison_path = build_comparison_report(all_results, config)
     logger.info("Comparison report: %s", comparison_path)
-    dashboard_path = build_reviewer_dashboard(
-        all_results,
-        config,
-        progress_runs=progress,
-        comparison_report_path=comparison_path,
-        proof_since_utc=run_started_utc,
-    )
-    logger.info("Reviewer dashboard: %s", dashboard_path)
+    reviewer_ui_cmd = r".\.venv\Scripts\streamlit run ui\reviewer_app.py"
 
     progress_dir = resolve_path(config, config["paths"]["progress_dir"])
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -233,7 +279,7 @@ async def main() -> None:
             {
                 "runs": progress,
                 "comparison_report": str(comparison_path),
-                "reviewer_dashboard": str(dashboard_path),
+                "reviewer_ui_command": reviewer_ui_cmd,
                 "run_started_utc": run_started_utc.isoformat().replace("+00:00", "Z"),
             },
             f,

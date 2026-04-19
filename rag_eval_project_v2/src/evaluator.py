@@ -46,7 +46,8 @@ class RAGASEvaluator:
         self.config = config
         eval_cfg = config.get("evaluation", {})
         judge_cfg = eval_cfg.get("judge", {})
-        self.judge_provider = str(judge_cfg.get("provider", "openrouter")).lower()
+        provider = str(judge_cfg.get("provider", "openrouter")).lower()
+        self.judge_provider = "openrouter" if provider in {"openrouter", "kimi_cloud", "kimi"} else provider
         self.judge_model = judge_cfg.get("model", "moonshotai/kimi-k2")
         self.ollama_base_url = str(judge_cfg.get("ollama_base_url", "http://localhost:11434")).rstrip("/")
         self.judge_base_url = judge_cfg.get("base_url", "https://openrouter.ai/api/v1").rstrip("/")
@@ -139,7 +140,13 @@ class RAGASEvaluator:
             timeout = httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.get(url, headers=headers)
-                self._judge_available = resp.status_code < 500
+                if resp.status_code >= 400:
+                    self._judge_available = False
+                    return False
+                model_ids = {m.get("id", "") for m in resp.json().get("data", [])}
+                self._judge_available = self.judge_model in model_ids or not model_ids
+                if not self._judge_available and self.strict_mode and not self.allow_heuristic_fallback:
+                    raise RuntimeError(f"Judge model '{self.judge_model}' is not available on OpenRouter.")
         except Exception as e:
             self._judge_available = False
             if self.strict_mode and not self.allow_heuristic_fallback:

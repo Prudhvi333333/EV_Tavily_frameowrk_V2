@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from src.generator import OllamaGenerator
+from src.generator import OllamaGenerator, OpenRouterGenerator
 from src.utils.config_loader import resolve_path
 from src.utils.logger import get_logger
 
@@ -79,6 +79,7 @@ class ValidationResult:
     s1_keyword: float
     s2_semantic: float
     s3_llm: float
+    s3_partial_relevance: float
     s3_reason: str
     url: str
     source_domain: str
@@ -86,7 +87,7 @@ class ValidationResult:
     text_preview: str
 
 
-def parse_judge_response(response: str, strict_mode: bool = True) -> tuple[float, str]:
+def parse_judge_response(response: str, strict_mode: bool = True) -> tuple[float, float, str]:
     cleaned = response.strip()
     if cleaned.startswith("```"):
         lines: list[str] = []
@@ -99,13 +100,18 @@ def parse_judge_response(response: str, strict_mode: bool = True) -> tuple[float
     try:
         parsed = json.loads(cleaned)
         score_raw = float(parsed.get("score", 0))
+        partial_raw = parsed.get("partial_relevance", None)
         reason = str(parsed.get("reason", "")).strip() or "no_reason"
         score = round(min(max(score_raw / 10.0, 0.0), 1.0), 4)
-        return score, reason
+        if partial_raw is None:
+            partial = score
+        else:
+            partial = round(min(max(float(partial_raw), 0.0), 1.0), 4)
+        return score, partial, reason
     except Exception as exc:
         if strict_mode:
             raise RuntimeError(f"Failed to parse LLM judge JSON: {response!r}") from exc
-        return 0.5, "parse_error"
+        return 0.5, 0.5, "parse_error"
 
 
 class KBCentroidValidator:
@@ -177,6 +183,7 @@ class ProofLogger:
                     "s1_keyword": result.s1_keyword,
                     "s2_semantic": result.s2_semantic,
                     "s3_llm": result.s3_llm,
+                    "s3_partial_relevance": result.s3_partial_relevance,
                 },
                 "s3_reason": result.s3_reason,
                 "injected_as": injected_as,
@@ -193,7 +200,7 @@ class DocumentValidator:
         self,
         config: dict[str, Any],
         kb_centroid_validator: KBCentroidValidator,
-        qwen_generator: OllamaGenerator,
+        qwen_generator: Any,
         logger: Any,
     ) -> None:
         self.config = config
@@ -203,6 +210,9 @@ class DocumentValidator:
         self.threshold = float(web_cfg.get("threshold", 0.60))
         self.low_confidence_floor = float(web_cfg.get("low_confidence_floor", 0.55))
         self.llm_min_score = float(web_cfg.get("llm_min_score", 0.20))
+        self.partial_relevance_floor = float(web_cfg.get("partial_relevance_floor", 0.20))
+        self.partial_semantic_override_min = float(web_cfg.get("partial_semantic_override_min", 0.72))
+        self.partial_keyword_override_min = float(web_cfg.get("partial_keyword_override_min", 0.45))
         weights = web_cfg.get("signal_weights", [0.40, 0.35, 0.25])
         if not isinstance(weights, list) or len(weights) != 3:
             raise ValueError("web_validator.signal_weights must be a list of 3 values.")
@@ -223,6 +233,7 @@ class DocumentValidator:
                 s1_keyword=0.0,
                 s2_semantic=0.0,
                 s3_llm=0.0,
+                s3_partial_relevance=0.0,
                 s3_reason="empty_extracted_text",
                 url=url,
                 source_domain=source_domain,
@@ -232,14 +243,28 @@ class DocumentValidator:
 
         s1 = score_domain_keywords(text, self.keyword_config)
         s2 = self.centroid_validator.score(text)
-        s3, s3_reason = await self._llm_relevance_judge(text, question)
+        s3_raw, s3_partial, s3_reason = await self._llm_relevance_judge(text, question)
+        # Blend direct relevance score with partial-coverage estimate so 20% useful docs are not crushed to zero.
+        s3 = round(max(s3_raw, 0.8 * s3_partial), 4)
         w1, w2, w3 = self.weights
         final = round(s1 * w1 + s2 * w2 + s3 * w3, 4)
 
         if s3 < self.llm_min_score:
-            accepted = False
-            low_confidence = False
-            decision = f"REJECTED: llm_relevance={s3:.3f}"
+            if (
+                s3_partial >= self.partial_relevance_floor
+                and s2 >= self.partial_semantic_override_min
+                and s1 >= self.partial_keyword_override_min
+            ):
+                accepted = True
+                low_confidence = True
+                decision = (
+                    f"ACCEPTED_PARTIAL_RELEVANCE: llm={s3:.3f}, partial={s3_partial:.3f}, "
+                    f"s2={s2:.3f}, s1={s1:.3f}"
+                )
+            else:
+                accepted = False
+                low_confidence = False
+                decision = f"REJECTED: llm_relevance={s3:.3f}"
         elif final >= self.threshold:
             accepted = True
             low_confidence = False
@@ -260,6 +285,7 @@ class DocumentValidator:
             s1_keyword=s1,
             s2_semantic=s2,
             s3_llm=s3,
+            s3_partial_relevance=s3_partial,
             s3_reason=s3_reason,
             url=url,
             source_domain=source_domain,
@@ -267,15 +293,21 @@ class DocumentValidator:
             text_preview=preview,
         )
 
-    async def _llm_relevance_judge(self, text: str, question: str) -> tuple[float, str]:
+    async def _llm_relevance_judge(self, text: str, question: str) -> tuple[float, float, str]:
         prompt = (
-            "Rate how relevant this document is to the topic:\n"
-            "'Georgia EV automotive supply chain, battery companies, OEM suppliers'\n"
-            "Document excerpt:\n"
-            f"{text[:600]}\n"
-            "Question being researched:\n"
-            f"{question}\n"
-            'Respond with ONLY this JSON, nothing else:\n{"score": <integer 0-10>, "reason": "<one sentence>"}'
+            "You are validating whether a crawled document is useful for a retrieval-augmented answer.\n"
+            "Score relevance to the QUESTION, not to generic EV text.\n\n"
+            "Rubric:\n"
+            "0 = completely unrelated\n"
+            "2 = only weak/tangential relevance (~10-20%)\n"
+            "4 = partially useful (~20-40%)\n"
+            "6 = moderately useful (~40-60%)\n"
+            "8 = strongly useful (~60-80%)\n"
+            "10 = directly answers key parts (>80%)\n"
+            "Important: use score 0 only when truly unrelated.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Document excerpt:\n{text[:1400]}\n\n"
+            'Respond with ONLY JSON:\n{"score": <0-10>, "partial_relevance": <0.0-1.0>, "reason": "<one short sentence>"}'
         )
         response = await self.qwen.generate(prompt=prompt, system="Return strict JSON only.", temperature=0.0)
         return parse_judge_response(response, strict_mode=self.strict_mode)
@@ -308,8 +340,20 @@ class WebCrawler:
 
         qwen_model = config.get("hyde", {}).get("model", "qwen2.5:14b")
         self.local_qwen = OllamaGenerator(qwen_model, strict=self.strict_mode)
+        web_judge_cfg = config.get("web_validator", {}).get("judge", {})
+        web_judge_provider = str(web_judge_cfg.get("provider", "ollama")).lower()
+        web_judge_model = str(web_judge_cfg.get("model", qwen_model))
+        if web_judge_provider in {"openrouter", "kimi_cloud", "kimi"}:
+            self.web_relevance_judge = OpenRouterGenerator(
+                web_judge_model,
+                api_key_env=str(web_judge_cfg.get("api_key_env", "OPENROUTER_API_KEY")),
+                base_url=str(web_judge_cfg.get("base_url", "https://openrouter.ai/api/v1")),
+                strict=self.strict_mode,
+            )
+        else:
+            self.web_relevance_judge = OllamaGenerator(web_judge_model, strict=self.strict_mode)
         self.centroid_validator = KBCentroidValidator(kb_collection, embedding_model)
-        self.validator = DocumentValidator(config, self.centroid_validator, self.local_qwen, self.logger)
+        self.validator = DocumentValidator(config, self.centroid_validator, self.web_relevance_judge, self.logger)
         self.proof_logger = ProofLogger(config, self.logger)
 
         self.cross_encoder_model = config.get("embeddings", {}).get(
@@ -335,15 +379,16 @@ class WebCrawler:
 
     async def extract_relevant(self, raw_text: str, question: str) -> str:
         prompt = (
-            "Extract the 2-6 most relevant factual sentences for the question.\n"
+            "Extract factual snippets that help answer the question.\n"
+            "If only part of the text is relevant, keep that partial section.\n"
             "Keep original facts. Do not add new claims. Return plain text only.\n\n"
             f"Question: {question}\n"
             f"Text: {raw_text[:2500]}"
         )
         response = await self.local_qwen.generate(prompt=prompt, system="Extract relevant evidence only.")
         extracted = response.strip()
-        if not extracted and self.strict_mode:
-            raise RuntimeError("LLM extraction returned empty text for web document.")
+        if not extracted:
+            extracted = raw_text[:1200].strip()
         return extracted
 
     async def crawl(self, question: str, question_id: str = "", pipeline: str = "") -> dict[str, Any]:
@@ -388,6 +433,7 @@ class WebCrawler:
                             s1_keyword=0.0,
                             s2_semantic=0.0,
                             s3_llm=0.0,
+                            s3_partial_relevance=0.0,
                             s3_reason="firecrawl_timeout",
                             url=url,
                             source_domain=_domain_of_url(url),
@@ -403,6 +449,7 @@ class WebCrawler:
                             s1_keyword=0.0,
                             s2_semantic=0.0,
                             s3_llm=0.0,
+                            s3_partial_relevance=0.0,
                             s3_reason=f"firecrawl_error:{type(exc).__name__}",
                             url=url,
                             source_domain=_domain_of_url(url),
@@ -418,6 +465,7 @@ class WebCrawler:
                                 s1_keyword=0.0,
                                 s2_semantic=0.0,
                                 s3_llm=0.0,
+                                s3_partial_relevance=0.0,
                                 s3_reason="firecrawl_empty",
                                 url=url,
                                 source_domain=_domain_of_url(url),
@@ -427,7 +475,8 @@ class WebCrawler:
                         else:
                             try:
                                 extracted = await self.extract_relevant(raw_text, question)
-                                vr = await self.validator.validate(extracted, url, question)
+                                validation_text = raw_text[:2800].strip() or extracted
+                                vr = await self.validator.validate(validation_text, url, question)
                             except Exception as exc:
                                 self.logger.warning("Validation failed for %s: %s", url, exc)
                                 vr = ValidationResult(
@@ -437,6 +486,7 @@ class WebCrawler:
                                     s1_keyword=0.0,
                                     s2_semantic=0.0,
                                     s3_llm=0.0,
+                                    s3_partial_relevance=0.0,
                                     s3_reason=f"validation_error:{type(exc).__name__}",
                                     url=url,
                                     source_domain=_domain_of_url(url),
@@ -469,6 +519,7 @@ class WebCrawler:
                                     "s1_keyword": vr.s1_keyword,
                                     "s2_semantic": vr.s2_semantic,
                                     "s3_llm": vr.s3_llm,
+                                    "s3_partial_relevance": vr.s3_partial_relevance,
                                 },
                                 "decision": vr.decision,
                             }
@@ -610,6 +661,7 @@ class WebCrawler:
                 "s1_keyword": result.s1_keyword,
                 "s2_semantic": result.s2_semantic,
                 "s3_llm": result.s3_llm,
+                "s3_partial_relevance": result.s3_partial_relevance,
             },
             "s3_reason": result.s3_reason,
             "text_preview": result.text_preview,

@@ -1,7 +1,10 @@
 param(
   [switch]$Tune,
   [switch]$AllModels,
-  [int]$Limit = 0
+  [int]$Limit = 0,
+  [ValidateSet("test", "train", "both")]
+  [string]$EvalSplit = "test",
+  [switch]$UseKimiCloudJudge
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +54,10 @@ if (-not $env:FIRECRAWL_API_KEY) {
   throw "FIRECRAWL_API_KEY is not set. It is required for rag_pretrained_web pipeline."
 }
 
+if ($UseKimiCloudJudge -and -not $env:OPENROUTER_API_KEY) {
+  throw "OPENROUTER_API_KEY is required when -UseKimiCloudJudge is enabled."
+}
+
 Write-Host "Running tests..."
 & $pythonExe -m pytest -q
 
@@ -66,9 +73,12 @@ if ($AllModels) {
   $models = @("qwen")
 }
 
-$cmdArgs = @("main.py", "--models") + $models + @("--pipelines") + $pipelines
+$cmdArgs = @("main.py", "--models") + $models + @("--pipelines") + $pipelines + @("--eval-split", $EvalSplit)
 if ($Limit -gt 0) {
   $cmdArgs += @("--limit", "$Limit")
+}
+if ($UseKimiCloudJudge) {
+  $cmdArgs += @("--use-kimi-cloud-judge")
 }
 
 Write-Host "Running main pipeline..."

@@ -14,7 +14,7 @@ This project implements the PDF blueprint with:
 - Metric-set-aware evaluation
 - Local validation cross-check for judge scores
 - Per-run Excel reports + global comparison report
-- Reviewer-friendly HTML dashboard (`outputs/reports/REVIEWER_DASHBOARD.html`)
+- Reviewer-friendly Streamlit UI (`ui/reviewer_app.py`)
 
 ## Setup (one-time)
 
@@ -47,6 +47,20 @@ Standard run (full test split, all 4 pipelines with Qwen):
 .\.venv\Scripts\python main.py --models qwen --pipelines rag no_rag rag_pretrained rag_pretrained_web
 ```
 
+Run train split, test split, or both:
+
+```powershell
+.\.venv\Scripts\python main.py --eval-split train --models qwen --pipelines rag_pretrained_web
+.\.venv\Scripts\python main.py --eval-split test --models qwen --pipelines rag_pretrained_web
+.\.venv\Scripts\python main.py --eval-split both --models qwen --pipelines rag_pretrained_web
+```
+
+Use Kimi Cloud judge (requires `OPENROUTER_API_KEY`):
+
+```powershell
+.\.venv\Scripts\python main.py --use-kimi-cloud-judge --models qwen --pipelines rag_pretrained_web --limit 1
+```
+
 Run tests:
 
 ```powershell
@@ -70,6 +84,10 @@ Run train tuning:
 `runtime.strict_mode: true` is enabled by default. Missing models/services now fail fast.
 Default judge is local Ollama `qwen2.5:14b` (`evaluation.judge.provider: ollama`).
 `main.py` and `scripts/run_everything.ps1` both auto-load keys from `.env`.
+You can switch judges at runtime with flags:
+- `--use-kimi-cloud-judge`
+- `--judge-provider`, `--judge-model`
+- `--web-judge-provider`, `--web-judge-model`
 
 ## Embedding model profiles
 
@@ -115,6 +133,16 @@ Run everything with a question limit (fast validation):
 .\scripts\run_everything.ps1 -Limit 1
 ```
 
+## Reviewer UI
+
+Run the Streamlit reviewer UI:
+
+```powershell
+.\scripts\run_ui.ps1
+```
+
+Open the URL printed by Streamlit (usually `http://localhost:8501`).
+
 ## Validation visibility additions
 
 Each report now includes:
@@ -123,9 +151,9 @@ Each report now includes:
 - `Validation_Reason`
 - `Validation_Audit` sheet with flagged metrics
 - `Web_Validation` sheet for per-document web validation signals
+- `S3_Partial_Relevance` for edge-case web relevance visibility
 - adjusted score tracking when a metric is flagged
-- HTML dashboard with run cards + question outcomes + web validation table + proof log table:
-  - `outputs/reports/REVIEWER_DASHBOARD.html`
+- Interactive reviewer UI for run cards + question outcomes + web validation + proof table
 
 Web proof log (append-only JSONL):
 

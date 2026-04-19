@@ -235,6 +235,7 @@ def _build_web_validation_sheet(results: list[dict[str, Any]]) -> pd.DataFrame:
                     "S1_Keyword": signals.get("s1_keyword", np.nan),
                     "S2_Semantic": signals.get("s2_semantic", np.nan),
                     "S3_LLM": signals.get("s3_llm", np.nan),
+                    "S3_Partial_Relevance": signals.get("s3_partial_relevance", np.nan),
                     "S3_Reason": record.get("s3_reason", ""),
                     "Text_Preview": record.get("text_preview", ""),
                 }
@@ -256,6 +257,7 @@ def _build_web_validation_sheet(results: list[dict[str, Any]]) -> pd.DataFrame:
                 "S1_Keyword": np.nan,
                 "S2_Semantic": np.nan,
                 "S3_LLM": np.nan,
+                "S3_Partial_Relevance": np.nan,
                 "S3_Reason": "",
                 "Text_Preview": "",
             }
