@@ -9,10 +9,12 @@ This project implements the PDF blueprint with:
   - `rag_pretrained`
   - `rag_pretrained_web`
 - HyDE query expansion
-- Web crawling with cache
+- Web crawling via Tavily + Firecrawl
+- Document validation (3-signal scoring + proof logging)
 - Metric-set-aware evaluation
 - Local validation cross-check for judge scores
 - Per-run Excel reports + global comparison report
+- Reviewer-friendly HTML dashboard (`outputs/reports/REVIEWER_DASHBOARD.html`)
 
 ## Setup (one-time)
 
@@ -23,6 +25,12 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ollama pull qwen2.5:14b
 ollama pull nomic-embed-text
+```
+
+Create/update local env file (already scaffolded):
+
+```powershell
+notepad .env
 ```
 
 ## Run project (common commands)
@@ -55,11 +63,13 @@ Run train tuning:
 
 - `OPENROUTER_API_KEY` (for Kimi K2 judge via OpenRouter)
 - `GEMINI_API_KEY` (for Gemini generation pipeline)
-- `TAVILY_API_KEY` (optional alternative search backend)
+- `TAVILY_API_KEY` (required for `rag_pretrained_web`)
+- `FIRECRAWL_API_KEY` (required for `rag_pretrained_web`)
 - `OLLAMA_BASE_URL` (defaults to `http://localhost:11434`)
 
 `runtime.strict_mode: true` is enabled by default. Missing models/services now fail fast.
 Default judge is local Ollama `qwen2.5:14b` (`evaluation.judge.provider: ollama`).
+`main.py` and `scripts/run_everything.ps1` both auto-load keys from `.env`.
 
 ## Embedding model profiles
 
@@ -112,4 +122,11 @@ Each report now includes:
 - `Validation_Flags`
 - `Validation_Reason`
 - `Validation_Audit` sheet with flagged metrics
+- `Web_Validation` sheet for per-document web validation signals
 - adjusted score tracking when a metric is flagged
+- HTML dashboard with run cards + question outcomes + web validation table + proof log table:
+  - `outputs/reports/REVIEWER_DASHBOARD.html`
+
+Web proof log (append-only JSONL):
+
+- `outputs/logs/web_validation_proof.jsonl`

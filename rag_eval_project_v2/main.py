@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from dotenv import load_dotenv
 
 from src.evaluator import RAGASEvaluator
 from src.few_shot_builder import FewShotBuilder
@@ -15,7 +16,7 @@ from src.generator import ModelGenerator, PipelineMode
 from src.hyde import HyDEExpander
 from src.indexer import build_or_load_index
 from src.kb_loader import load_kb
-from src.reporter import build_comparison_report, build_report
+from src.reporter import build_comparison_report, build_report, build_reviewer_dashboard
 from src.retriever import HybridRetriever
 from src.score_validator import ScoreValidator
 from src.splitter import load_split
@@ -89,13 +90,37 @@ async def run_single_pipeline(
 
         web_context = ""
         web_status = "NOT_USED"
+        web_docs: list[dict[str, Any]] = []
+        web_validation_records: list[dict[str, Any]] = []
+        web_search_query = ""
+        web_accepted = 0
+        web_low_confidence = 0
+        web_rejected = 0
+        web_timed_out = False
         if pipeline_mode == PipelineMode.RAG_PRETRAINED_WEB:
-            web_docs = await crawler.crawl(q)
+            try:
+                q_id_label = f"Q_{int(float(q_id)):03d}"
+            except Exception:
+                q_id_label = str(q_id)
+            crawl_payload = await crawler.crawl(
+                question=q,
+                question_id=q_id_label,
+                pipeline=f"{model_key}_{pipeline_mode.value}",
+            )
+            web_docs = list(crawl_payload.get("docs", []))
+            web_validation_records = list(crawl_payload.get("records", []))
+            web_search_query = str(crawl_payload.get("search_query", ""))
+            web_timed_out = bool(crawl_payload.get("timed_out", False))
+            web_accepted = sum(1 for r in web_validation_records if r.get("accepted"))
+            web_low_confidence = sum(1 for r in web_validation_records if r.get("low_confidence"))
+            web_rejected = sum(1 for r in web_validation_records if not r.get("accepted"))
             if web_docs:
-                web_context = "\n".join([f"{d['url']}\n{d['text']}" for d in web_docs])
-                web_status = "OK"
+                web_context = "\n\n".join([str(d.get("context_block", "")).strip() for d in web_docs if str(d.get("context_block", "")).strip()])
+                web_status = "PARTIAL_TIMEOUT_OK" if web_timed_out else "OK"
+            elif web_validation_records:
+                web_status = "PARTIAL_TIMEOUT_NO_ACCEPTED" if web_timed_out else "REJECTED_ALL"
             else:
-                web_status = "WEB_UNAVAILABLE"
+                web_status = "WEB_TIMEOUT" if web_timed_out else "WEB_UNAVAILABLE"
 
         answer = await generator.generate_with_mode(
             question=q,
@@ -113,6 +138,13 @@ async def run_single_pipeline(
                 "kb_context": kb_context,
                 "web_context": web_context,
                 "web_status": web_status,
+                "web_search_query": web_search_query,
+                "web_timed_out": web_timed_out,
+                "web_docs_selected": web_docs,
+                "web_validation_records": web_validation_records,
+                "web_accepted_count": web_accepted,
+                "web_low_confidence_count": web_low_confidence,
+                "web_rejected_count": web_rejected,
                 "retrieved_docs": [d.id for d in docs],
                 "model_key": model_key,
                 "pipeline_mode": pipeline_mode.value,
@@ -122,7 +154,9 @@ async def run_single_pipeline(
 
 
 async def main() -> None:
+    run_started_utc = datetime.now(timezone.utc)
     args = _parse_args()
+    load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
     config = load_config(args.config)
     logger = get_logger("main", config)
 
@@ -134,7 +168,7 @@ async def main() -> None:
     kb_docs = load_kb(config)
     index = build_or_load_index(config, kb_docs)
     retriever = HybridRetriever(index, config)
-    crawler = WebCrawler(config)
+    crawler = WebCrawler(config, kb_collection=index.collection, embedding_model=index.embedder)
     evaluator = RAGASEvaluator(config)
     validator = ScoreValidator(config)
     few_shot_builder = FewShotBuilder(train_df, config)
@@ -182,12 +216,29 @@ async def main() -> None:
 
     comparison_path = build_comparison_report(all_results, config)
     logger.info("Comparison report: %s", comparison_path)
+    dashboard_path = build_reviewer_dashboard(
+        all_results,
+        config,
+        progress_runs=progress,
+        comparison_report_path=comparison_path,
+        proof_since_utc=run_started_utc,
+    )
+    logger.info("Reviewer dashboard: %s", dashboard_path)
 
     progress_dir = resolve_path(config, config["paths"]["progress_dir"])
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     progress_path = Path(progress_dir) / f"run_progress_{ts}.json"
     with progress_path.open("w", encoding="utf-8") as f:
-        json.dump({"runs": progress, "comparison_report": str(comparison_path)}, f, indent=2)
+        json.dump(
+            {
+                "runs": progress,
+                "comparison_report": str(comparison_path),
+                "reviewer_dashboard": str(dashboard_path),
+                "run_started_utc": run_started_utc.isoformat().replace("+00:00", "Z"),
+            },
+            f,
+            indent=2,
+        )
     logger.info("Progress log written: %s", progress_path)
 
 

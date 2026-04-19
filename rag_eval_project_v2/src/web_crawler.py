@@ -4,21 +4,17 @@ import asyncio
 import hashlib
 import json
 import os
-import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-import httpx
-from bs4 import BeautifulSoup
+import numpy as np
 
 from src.generator import OllamaGenerator
 from src.utils.config_loader import resolve_path
 from src.utils.logger import get_logger
-
-try:
-    from duckduckgo_search import DDGS
-except Exception:  # pragma: no cover - optional dependency
-    DDGS = None
 
 try:
     from tavily import TavilyClient
@@ -26,189 +22,609 @@ except Exception:  # pragma: no cover - optional dependency
     TavilyClient = None
 
 try:
+    from firecrawl import FirecrawlApp
+except Exception:  # pragma: no cover - optional dependency
+    FirecrawlApp = None
+
+try:
     from sentence_transformers import CrossEncoder
 except Exception:  # pragma: no cover - optional dependency
     CrossEncoder = None
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text).casefold().split())
+
+
+def _domain_of_url(url: str) -> str:
+    host = urlparse(url).netloc.casefold().strip()
+    if host.startswith("www."):
+        return host[4:]
+    return host
+
+
+def _prepare_keywords(items: list[Any]) -> list[str]:
+    normalized: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        # Support either one phrase per list item or comma-separated phrases.
+        parts = [part.strip() for part in item.split(",")]
+        for part in parts:
+            phrase = _normalize_text(part)
+            if phrase:
+                normalized.add(phrase)
+    return sorted(normalized)
+
+
+def score_domain_keywords(text: str, keyword_config: dict[str, Any]) -> float:
+    text_norm = _normalize_text(text)
+    tier1 = _prepare_keywords(keyword_config.get("tier1", []))
+    tier2 = _prepare_keywords(keyword_config.get("tier2", []))
+
+    tier1_hits = sum(1 for kw in tier1 if kw in text_norm)
+    tier2_hits = sum(1 for kw in tier2 if kw in text_norm)
+
+    score = min(tier1_hits * 0.15, 1.0)
+    if tier1_hits >= 1:
+        score = min(score + tier2_hits * 0.05, 1.0)
+    return round(float(score), 4)
+
+
+@dataclass
+class ValidationResult:
+    accepted: bool
+    low_confidence: bool
+    final_score: float
+    s1_keyword: float
+    s2_semantic: float
+    s3_llm: float
+    s3_reason: str
+    url: str
+    source_domain: str
+    decision: str
+    text_preview: str
+
+
+def parse_judge_response(response: str, strict_mode: bool = True) -> tuple[float, str]:
+    cleaned = response.strip()
+    if cleaned.startswith("```"):
+        lines: list[str] = []
+        for line in cleaned.splitlines():
+            if line.strip().startswith("```"):
+                continue
+            lines.append(line)
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+        score_raw = float(parsed.get("score", 0))
+        reason = str(parsed.get("reason", "")).strip() or "no_reason"
+        score = round(min(max(score_raw / 10.0, 0.0), 1.0), 4)
+        return score, reason
+    except Exception as exc:
+        if strict_mode:
+            raise RuntimeError(f"Failed to parse LLM judge JSON: {response!r}") from exc
+        return 0.5, "parse_error"
+
+
+class KBCentroidValidator:
+    def __init__(self, collection: Any, embedding_model: Any) -> None:
+        self.collection = collection
+        self.embedding_model = embedding_model
+        payload = self.collection.get(include=["embeddings"])
+        all_embeddings = payload.get("embeddings", []) if isinstance(payload, dict) else []
+        if all_embeddings is None:
+            raise RuntimeError("Chroma collection returned no embeddings; cannot compute KB centroid.")
+        if hasattr(all_embeddings, "__len__") and len(all_embeddings) == 0:
+            raise RuntimeError("Chroma collection has no embeddings; cannot compute KB centroid.")
+        arr = np.asarray(all_embeddings, dtype=float)
+        centroid = np.mean(arr, axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm == 0:
+            raise RuntimeError("KB centroid norm is zero; invalid embedding state.")
+        self.centroid = centroid / norm
+
+    def score(self, text: str) -> float:
+        vec = self.embedding_model.encode([text], normalize_embeddings=True, convert_to_numpy=True)[0]
+        vec = np.asarray(vec, dtype=float)
+        vec_norm = float(np.linalg.norm(vec))
+        if vec_norm == 0:
+            return 0.0
+        vec = vec / vec_norm
+        similarity = float(np.dot(vec, self.centroid))
+        similarity = max(0.0, min(1.0, similarity))
+        return round(similarity, 4)
+
+
+class ProofLogger:
+    def __init__(self, config: dict[str, Any], logger: Any) -> None:
+        self.logger = logger
+        self.path = resolve_path(config, config["paths"]["logs_dir"]) / "web_validation_proof.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(
+        self,
+        question: str,
+        search_query: str,
+        result: ValidationResult,
+        question_id: str = "",
+        pipeline: str = "",
+    ) -> None:
+        try:
+            if result.accepted:
+                if result.low_confidence:
+                    injected_as = (
+                        f"[WEB | confidence: {result.final_score:.3f} | LOW_CONFIDENCE | "
+                        f"source: {result.source_domain}]"
+                    )
+                else:
+                    injected_as = f"[WEB | confidence: {result.final_score:.3f} | source: {result.source_domain}]"
+            else:
+                injected_as = None
+
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "question": question,
+                "question_id": question_id,
+                "pipeline": pipeline,
+                "search_query": search_query,
+                "url": result.url,
+                "source_domain": result.source_domain,
+                "decision": result.decision,
+                "final_score": result.final_score,
+                "signals": {
+                    "s1_keyword": result.s1_keyword,
+                    "s2_semantic": result.s2_semantic,
+                    "s3_llm": result.s3_llm,
+                },
+                "s3_reason": result.s3_reason,
+                "injected_as": injected_as,
+                "text_preview": result.text_preview[:240],
+            }
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:  # pragma: no cover - I/O resilience
+            self.logger.warning("Proof logging failed for %s: %s", result.url, exc)
+
+
+class DocumentValidator:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        kb_centroid_validator: KBCentroidValidator,
+        qwen_generator: OllamaGenerator,
+        logger: Any,
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
+        web_cfg = config.get("web_validator", {})
+        self.threshold = float(web_cfg.get("threshold", 0.60))
+        self.low_confidence_floor = float(web_cfg.get("low_confidence_floor", 0.55))
+        self.llm_min_score = float(web_cfg.get("llm_min_score", 0.20))
+        weights = web_cfg.get("signal_weights", [0.40, 0.35, 0.25])
+        if not isinstance(weights, list) or len(weights) != 3:
+            raise ValueError("web_validator.signal_weights must be a list of 3 values.")
+        self.weights = [float(w) for w in weights]
+        self.keyword_config = web_cfg.get("domain_keywords", {})
+        self.centroid_validator = kb_centroid_validator
+        self.qwen = qwen_generator
+
+    async def validate(self, text: str, url: str, question: str) -> ValidationResult:
+        source_domain = _domain_of_url(url)
+        preview = text[:240]
+
+        if not text.strip():
+            return ValidationResult(
+                accepted=False,
+                low_confidence=False,
+                final_score=0.0,
+                s1_keyword=0.0,
+                s2_semantic=0.0,
+                s3_llm=0.0,
+                s3_reason="empty_extracted_text",
+                url=url,
+                source_domain=source_domain,
+                decision="REJECTED: score=0.000",
+                text_preview=preview,
+            )
+
+        s1 = score_domain_keywords(text, self.keyword_config)
+        s2 = self.centroid_validator.score(text)
+        s3, s3_reason = await self._llm_relevance_judge(text, question)
+        w1, w2, w3 = self.weights
+        final = round(s1 * w1 + s2 * w2 + s3 * w3, 4)
+
+        if s3 < self.llm_min_score:
+            accepted = False
+            low_confidence = False
+            decision = f"REJECTED: llm_relevance={s3:.3f}"
+        elif final >= self.threshold:
+            accepted = True
+            low_confidence = False
+            decision = "ACCEPTED"
+        elif final >= self.low_confidence_floor:
+            accepted = True
+            low_confidence = True
+            decision = f"ACCEPTED_LOW_CONFIDENCE: score={final:.3f}"
+        else:
+            accepted = False
+            low_confidence = False
+            decision = f"REJECTED: score={final:.3f}"
+
+        return ValidationResult(
+            accepted=accepted,
+            low_confidence=low_confidence,
+            final_score=final,
+            s1_keyword=s1,
+            s2_semantic=s2,
+            s3_llm=s3,
+            s3_reason=s3_reason,
+            url=url,
+            source_domain=source_domain,
+            decision=decision,
+            text_preview=preview,
+        )
+
+    async def _llm_relevance_judge(self, text: str, question: str) -> tuple[float, str]:
+        prompt = (
+            "Rate how relevant this document is to the topic:\n"
+            "'Georgia EV automotive supply chain, battery companies, OEM suppliers'\n"
+            "Document excerpt:\n"
+            f"{text[:600]}\n"
+            "Question being researched:\n"
+            f"{question}\n"
+            'Respond with ONLY this JSON, nothing else:\n{"score": <integer 0-10>, "reason": "<one sentence>"}'
+        )
+        response = await self.qwen.generate(prompt=prompt, system="Return strict JSON only.", temperature=0.0)
+        return parse_judge_response(response, strict_mode=self.strict_mode)
+
+
 class WebCrawler:
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        kb_collection: Any,
+        embedding_model: Any,
+    ) -> None:
         self.config = config
         self.logger = get_logger("web_crawler", config)
+        self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
+
         crawler_cfg = config.get("crawler", {})
-        self.timeout_per_url = float(crawler_cfg.get("timeout_per_url", 8))
-        self.total_timeout = float(crawler_cfg.get("total_timeout", 30))
+        self.timeout_per_url = float(crawler_cfg.get("timeout_per_url", 20))
+        self.total_timeout = float(crawler_cfg.get("total_timeout", 60))
         self.max_urls = int(crawler_cfg.get("max_urls", 5))
         self.top_results = int(crawler_cfg.get("top_results", 2))
         self.cache_enabled = bool(crawler_cfg.get("cache_enabled", True))
         self.cache_dir = resolve_path(config, config["paths"]["web_cache_dir"])
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.local_qwen = OllamaGenerator(config.get("hyde", {}).get("model", "qwen2.5:14b"))
+        self.tavily_key_env = str(crawler_cfg.get("tavily_api_key_env", "TAVILY_API_KEY"))
+        self.firecrawl_key_env = str(crawler_cfg.get("firecrawl_api_key_env", "FIRECRAWL_API_KEY"))
+        self.tavily_api_key = os.getenv(self.tavily_key_env, "").strip()
+        self.firecrawl_api_key = os.getenv(self.firecrawl_key_env, "").strip()
+
+        qwen_model = config.get("hyde", {}).get("model", "qwen2.5:14b")
+        self.local_qwen = OllamaGenerator(qwen_model, strict=self.strict_mode)
+        self.centroid_validator = KBCentroidValidator(kb_collection, embedding_model)
+        self.validator = DocumentValidator(config, self.centroid_validator, self.local_qwen, self.logger)
+        self.proof_logger = ProofLogger(config, self.logger)
+
         self.cross_encoder_model = config.get("embeddings", {}).get(
             "cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
         )
         self._cross_encoder = None
+        self._tavily_client = TavilyClient(api_key=self.tavily_api_key) if TavilyClient and self.tavily_api_key else None
+        self._firecrawl_app = FirecrawlApp(api_key=self.firecrawl_api_key) if FirecrawlApp and self.firecrawl_api_key else None
 
     async def generate_search_query(self, question: str) -> str:
         prompt = (
-            f"Generate ONE high-quality web search query for this question:\n{question}\n"
-            "Return only the query text."
+            "Generate ONE web search query for this research question.\n"
+            "Return only query text.\n"
+            f"Question: {question}"
         )
-        response = await self.local_qwen.generate(prompt=prompt, system="Return one search query.")
-        query = response.strip().splitlines()[0] if response.strip() else question
-        return query.strip('" ')
-
-    async def fetch_url(self, url: str) -> str | None:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; RAG-Eval/2.0)"}
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_per_url, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-            text = " ".join(paragraphs)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:2000] if text else None
-        except Exception:
-            return None
+        response = await self.local_qwen.generate(prompt=prompt, system="Return one query only.", temperature=0.0)
+        query = response.strip().splitlines()[0].strip().strip('"') if response.strip() else ""
+        if not query:
+            if self.strict_mode:
+                raise RuntimeError("Search query generation returned empty output.")
+            return question
+        return query
 
     async def extract_relevant(self, raw_text: str, question: str) -> str:
         prompt = (
-            "From the text below, extract 2-4 sentences that are directly relevant to the question.\n"
-            "Return only those sentences.\n\n"
+            "Extract the 2-6 most relevant factual sentences for the question.\n"
+            "Keep original facts. Do not add new claims. Return plain text only.\n\n"
             f"Question: {question}\n"
-            f"Text: {raw_text[:1500]}"
+            f"Text: {raw_text[:2500]}"
         )
-        extracted = await self.local_qwen.generate(prompt=prompt, system="Extract relevant evidence only.")
-        cleaned = extracted.strip()
-        if cleaned:
-            return cleaned
-        return self._keyword_extract(raw_text, question)
+        response = await self.local_qwen.generate(prompt=prompt, system="Extract relevant evidence only.")
+        extracted = response.strip()
+        if not extracted and self.strict_mode:
+            raise RuntimeError("LLM extraction returned empty text for web document.")
+        return extracted
 
-    async def crawl(self, question: str) -> list[dict[str, str]]:
+    async def crawl(self, question: str, question_id: str = "", pipeline: str = "") -> dict[str, Any]:
         cache_path = self._cache_path(question)
         if self.cache_enabled and cache_path.exists():
             try:
                 with cache_path.open("r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
-                pass
+                self.logger.warning("Web cache read failed for %s; rebuilding.", question[:80])
 
+        result_payload = {"docs": [], "records": [], "search_query": "", "timed_out": False}
+        accepted_docs: list[dict[str, Any]] = []
+        validation_records: list[dict[str, Any]] = []
         try:
             async with asyncio.timeout(self.total_timeout):
-                query = await self.generate_search_query(question)
-                urls = await self._search_web(query)
-                if not urls:
-                    return []
+                search_query = await self.generate_search_query(question)
+                result_payload["search_query"] = search_query
+                search_results = await self._search_tavily(search_query)
+                if not search_results:
+                    self.logger.warning("No Tavily search results for question: %s", question[:100])
+                    return result_payload
 
-                fetched = await asyncio.gather(*(self.fetch_url(url) for url in urls))
-                candidates: list[dict[str, str]] = []
-                for url, raw in zip(urls, fetched):
-                    if not raw:
+                for item in search_results:
+                    url = str(item.get("url", "")).strip()
+                    if not url:
                         continue
-                    relevant = await self.extract_relevant(raw, question)
-                    if relevant.strip():
-                        candidates.append({"url": url, "text": relevant.strip()})
 
-                ranked = await self._rerank(question, candidates)
-                result = ranked[: self.top_results]
+                    raw_text = ""
+                    extracted = ""
+                    try:
+                        raw_text = await asyncio.wait_for(
+                            self._scrape_with_firecrawl(url),
+                            timeout=self.timeout_per_url,
+                        )
+                    except TimeoutError:
+                        self.logger.warning("Firecrawl timeout for URL: %s", url)
+                        vr = ValidationResult(
+                            accepted=False,
+                            low_confidence=False,
+                            final_score=0.0,
+                            s1_keyword=0.0,
+                            s2_semantic=0.0,
+                            s3_llm=0.0,
+                            s3_reason="firecrawl_timeout",
+                            url=url,
+                            source_domain=_domain_of_url(url),
+                            decision="REJECTED: score=0.000",
+                            text_preview="",
+                        )
+                    except Exception as exc:
+                        self.logger.warning("Firecrawl failed for %s: %s", url, exc)
+                        vr = ValidationResult(
+                            accepted=False,
+                            low_confidence=False,
+                            final_score=0.0,
+                            s1_keyword=0.0,
+                            s2_semantic=0.0,
+                            s3_llm=0.0,
+                            s3_reason=f"firecrawl_error:{type(exc).__name__}",
+                            url=url,
+                            source_domain=_domain_of_url(url),
+                            decision="REJECTED: score=0.000",
+                            text_preview="",
+                        )
+                    else:
+                        if not raw_text.strip():
+                            vr = ValidationResult(
+                                accepted=False,
+                                low_confidence=False,
+                                final_score=0.0,
+                                s1_keyword=0.0,
+                                s2_semantic=0.0,
+                                s3_llm=0.0,
+                                s3_reason="firecrawl_empty",
+                                url=url,
+                                source_domain=_domain_of_url(url),
+                                decision="REJECTED: score=0.000",
+                                text_preview="",
+                            )
+                        else:
+                            try:
+                                extracted = await self.extract_relevant(raw_text, question)
+                                vr = await self.validator.validate(extracted, url, question)
+                            except Exception as exc:
+                                self.logger.warning("Validation failed for %s: %s", url, exc)
+                                vr = ValidationResult(
+                                    accepted=False,
+                                    low_confidence=False,
+                                    final_score=0.0,
+                                    s1_keyword=0.0,
+                                    s2_semantic=0.0,
+                                    s3_llm=0.0,
+                                    s3_reason=f"validation_error:{type(exc).__name__}",
+                                    url=url,
+                                    source_domain=_domain_of_url(url),
+                                    decision="REJECTED: score=0.000",
+                                    text_preview=(raw_text[:240] if raw_text else ""),
+                                )
+
+                    self.proof_logger.log(
+                        question=question,
+                        search_query=search_query,
+                        result=vr,
+                        question_id=question_id,
+                        pipeline=pipeline,
+                    )
+                    rec = self._validation_record(vr)
+                    validation_records.append(rec)
+                    result_payload["records"] = list(validation_records)
+
+                    if vr.accepted:
+                        context_block = self._web_context_block(vr, vr.text_preview if not raw_text.strip() else extracted)
+                        accepted_docs.append(
+                            {
+                                "url": vr.url,
+                                "source_domain": vr.source_domain,
+                                "text": extracted if raw_text.strip() else "",
+                                "confidence": vr.final_score,
+                                "low_confidence": vr.low_confidence,
+                                "context_block": context_block,
+                                "signals": {
+                                    "s1_keyword": vr.s1_keyword,
+                                    "s2_semantic": vr.s2_semantic,
+                                    "s3_llm": vr.s3_llm,
+                                },
+                                "decision": vr.decision,
+                            }
+                        )
+
+                result_payload["records"] = validation_records
+
+                if not accepted_docs:
+                    self.logger.warning("All web documents rejected for question: %s", question[:100])
+                    if self.cache_enabled:
+                        with cache_path.open("w", encoding="utf-8") as f:
+                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                    return result_payload
+
+                reranked = await self._rerank(question, accepted_docs)
+                result_payload["docs"] = reranked[: self.top_results]
+
                 if self.cache_enabled:
                     with cache_path.open("w", encoding="utf-8") as f:
-                        json.dump(result, f, ensure_ascii=False, indent=2)
-                return result
+                        json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                return result_payload
         except TimeoutError:
-            self.logger.warning("Crawler timeout for question: %s", question)
-            return []
-        except Exception as e:
-            self.logger.warning("Crawler error: %s", e)
+            self.logger.warning("Crawler timeout for question: %s", question[:100])
+            result_payload["timed_out"] = True
+            result_payload["records"] = list(validation_records)
+            if accepted_docs:
+                accepted_docs.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+                result_payload["docs"] = accepted_docs[: self.top_results]
+            return result_payload
+
+    async def _search_tavily(self, query: str) -> list[dict[str, str]]:
+        if self._tavily_client is None:
+            message = (
+                f"Tavily is not configured. Install tavily-python and set {self.tavily_key_env}."
+            )
+            if self.strict_mode:
+                raise RuntimeError(message)
+            self.logger.warning(message)
             return []
 
-    async def _search_web(self, query: str) -> list[str]:
-        urls = await self._search_ddg(query)
-        if urls:
-            return urls[: self.max_urls]
-        urls = await self._search_tavily(query)
-        return urls[: self.max_urls]
-
-    async def _search_ddg(self, query: str) -> list[str]:
-        if DDGS is None:
-            return []
-
-        def _run() -> list[str]:
-            out: list[str] = []
-            with DDGS() as ddgs:
-                for item in ddgs.text(query, max_results=self.max_urls):
-                    href = item.get("href") or item.get("url")
-                    if href:
-                        out.append(href)
+        def _run() -> list[dict[str, str]]:
+            response = self._tavily_client.search(
+                query=query,
+                max_results=self.max_urls,
+                search_depth="advanced",
+            )
+            out: list[dict[str, str]] = []
+            for item in response.get("results", []):
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+                out.append(
+                    {
+                        "url": url,
+                        "title": str(item.get("title", "")),
+                        "content": str(item.get("content", "")),
+                    }
+                )
             return out
 
         try:
             return await asyncio.to_thread(_run)
-        except Exception:
+        except Exception as exc:
+            if self.strict_mode:
+                raise RuntimeError("Tavily search failed.") from exc
+            self.logger.warning("Tavily search failed: %s", exc)
             return []
 
-    async def _search_tavily(self, query: str) -> list[str]:
-        if TavilyClient is None:
-            return []
-        api_key = os.getenv("TAVILY_API_KEY", "").strip()
-        if not api_key:
-            return []
+    async def _scrape_with_firecrawl(self, url: str) -> str:
+        if self._firecrawl_app is None:
+            message = (
+                f"Firecrawl is not configured. Install firecrawl and set {self.firecrawl_key_env}."
+            )
+            if self.strict_mode:
+                raise RuntimeError(message)
+            self.logger.warning(message)
+            return ""
 
-        def _run() -> list[str]:
-            client = TavilyClient(api_key=api_key)
-            result = client.search(query=query, max_results=self.max_urls)
-            urls: list[str] = []
-            for item in result.get("results", []):
-                url = item.get("url")
-                if url:
-                    urls.append(url)
-            return urls
+        def _run() -> str:
+            response = self._firecrawl_app.scrape(url, formats=["markdown"])
+            if isinstance(response, dict):
+                direct = str(response.get("markdown", "") or response.get("content", "")).strip()
+                if direct:
+                    return direct
+                data = response.get("data")
+                if isinstance(data, dict):
+                    nested = str(data.get("markdown", "") or data.get("content", "")).strip()
+                    if nested:
+                        return nested
+            # object-style response compatibility
+            if hasattr(response, "markdown"):
+                value = str(getattr(response, "markdown", "")).strip()
+                if value:
+                    return value
+            if hasattr(response, "data"):
+                data = getattr(response, "data")
+                if isinstance(data, dict):
+                    nested = str(data.get("markdown", "") or data.get("content", "")).strip()
+                    if nested:
+                        return nested
+            return ""
 
         try:
-            return await asyncio.to_thread(_run)
-        except Exception:
-            return []
+            content = await asyncio.to_thread(_run)
+            return content[:12000]
+        except Exception as exc:
+            if self.strict_mode:
+                raise RuntimeError(f"Firecrawl scrape failed for {url}.") from exc
+            self.logger.warning("Firecrawl scrape failed for %s: %s", url, exc)
+            return ""
 
-    async def _rerank(self, question: str, docs: list[dict[str, str]]) -> list[dict[str, str]]:
+    async def _rerank(self, question: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not docs:
             return []
         if CrossEncoder is None:
-            return self._rerank_lexical(question, docs)
-        try:
-            if self._cross_encoder is None:
-                self._cross_encoder = CrossEncoder(self.cross_encoder_model, local_files_only=True)
-            pairs = [[question, d["text"]] for d in docs]
-            scores = self._cross_encoder.predict(pairs)
-            with_scores = list(zip(docs, scores))
-            with_scores.sort(key=lambda x: float(x[1]), reverse=True)
-            return [d for d, _ in with_scores]
-        except Exception:
-            return self._rerank_lexical(question, docs)
+            raise RuntimeError("CrossEncoder is required for web reranking but is not installed.")
+        if self._cross_encoder is None:
+            self._cross_encoder = CrossEncoder(self.cross_encoder_model, local_files_only=True)
+        pairs = [[question, str(d.get("text", ""))] for d in docs]
+        scores = self._cross_encoder.predict(pairs)
+        zipped = list(zip(docs, scores))
+        zipped.sort(key=lambda x: float(x[1]), reverse=True)
+        out: list[dict[str, Any]] = []
+        for doc, score in zipped:
+            row = dict(doc)
+            row["rerank_score"] = float(score)
+            out.append(row)
+        return out
 
-    def _rerank_lexical(self, question: str, docs: list[dict[str, str]]) -> list[dict[str, str]]:
-        q_terms = set(re.findall(r"[a-z0-9]+", question.lower()))
-        scored: list[tuple[dict[str, str], float]] = []
-        for d in docs:
-            d_terms = set(re.findall(r"[a-z0-9]+", d["text"].lower()))
-            overlap = len(q_terms & d_terms) / max(len(q_terms), 1)
-            scored.append((d, overlap))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [d for d, _ in scored]
+    def _validation_record(self, result: ValidationResult) -> dict[str, Any]:
+        return {
+            "url": result.url,
+            "source_domain": result.source_domain,
+            "decision": result.decision,
+            "accepted": result.accepted,
+            "low_confidence": result.low_confidence,
+            "final_score": result.final_score,
+            "signals": {
+                "s1_keyword": result.s1_keyword,
+                "s2_semantic": result.s2_semantic,
+                "s3_llm": result.s3_llm,
+            },
+            "s3_reason": result.s3_reason,
+            "text_preview": result.text_preview,
+        }
 
-    def _keyword_extract(self, raw_text: str, question: str) -> str:
-        keywords = [k for k in re.findall(r"[a-zA-Z0-9]+", question.lower()) if len(k) > 3]
-        sentences = re.split(r"(?<=[.!?])\s+", raw_text)
-        picked: list[str] = []
-        for s in sentences:
-            sl = s.lower()
-            if any(k in sl for k in keywords):
-                picked.append(s.strip())
-            if len(picked) >= 4:
-                break
-        return " ".join(picked[:4]).strip()[:800]
+    def _web_context_block(self, result: ValidationResult, text: str) -> str:
+        if result.low_confidence:
+            header = (
+                f"[WEB | confidence: {result.final_score:.3f} | LOW_CONFIDENCE | "
+                f"source: {result.source_domain}]"
+            )
+        else:
+            header = f"[WEB | confidence: {result.final_score:.3f} | source: {result.source_domain}]"
+        return f"{header}\n{text.strip()}"
 
     def _cache_path(self, question: str) -> Path:
-        digest = hashlib.sha256(question.strip().lower().encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(question.strip().casefold().encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.json"

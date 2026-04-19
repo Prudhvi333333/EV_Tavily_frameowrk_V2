@@ -65,11 +65,58 @@ hyde:
     - comparison
 
 crawler:
-  timeout_per_url: 8
-  total_timeout: 30
-  max_urls: 5
+  timeout_per_url: 30
+  total_timeout: 240
+  max_urls: 3
   top_results: 2
   cache_enabled: true
+  search_provider: tavily
+  crawl_provider: firecrawl
+  tavily_api_key_env: TAVILY_API_KEY
+  firecrawl_api_key_env: FIRECRAWL_API_KEY
+
+web_validator:
+  threshold: 0.60
+  low_confidence_floor: 0.55
+  llm_min_score: 0.20
+  signal_weights:
+    - 0.40
+    - 0.35
+    - 0.25
+  domain_keywords:
+    tier1:
+      - electric vehicle
+      - ev battery
+      - lithium-ion
+      - battery cell
+      - battery pack
+      - supply chain
+      - automotive supplier
+      - tier 1
+      - tier 2
+      - oem
+      - original equipment manufacturer
+      - georgia manufacturer
+      - georgia automotive
+      - thermal management
+      - ev supply
+      - battery electrolyte
+    tier2:
+      - automotive
+      - manufacturing
+      - vehicle
+      - battery
+      - supplier
+      - hyundai
+      - kia
+      - rivian
+      - ford
+      - gm
+      - georgia
+      - plant
+      - facility
+      - production
+      - assembly
 
 evaluation:
   allow_heuristic_fallback: false
