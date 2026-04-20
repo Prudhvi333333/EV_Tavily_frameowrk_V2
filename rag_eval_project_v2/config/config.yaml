@@ -84,7 +84,7 @@ web_validator:
   partial_keyword_override_min: 0.45
   judge:
     provider: ollama
-    model: qwen2.5:14b
+    model: kimi-k2.5:cloud
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
   signal_weights:
@@ -130,13 +130,13 @@ evaluation:
   allow_heuristic_fallback: false
   judge:
     provider: ollama
-    model: qwen2.5:14b
+    model: kimi-k2.5:cloud
     ollama_base_url: http://localhost:11434
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
   validator:
     provider: ollama
-    model: qwen2.5:14b
+    model: kimi-k2.5:cloud
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     flag_threshold: 0.3
