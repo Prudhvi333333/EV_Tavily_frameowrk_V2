@@ -35,6 +35,12 @@ notepad .env
 
 ## Run project (common commands)
 
+Show all CLI options:
+
+```powershell
+.\.venv\Scripts\python main.py --help
+```
+
 Quick smoke run (first test question, all 4 pipelines with Qwen):
 
 ```powershell
@@ -59,6 +65,12 @@ Use Kimi Cloud judge (requires `OPENROUTER_API_KEY`):
 
 ```powershell
 .\.venv\Scripts\python main.py --use-kimi-cloud-judge --models qwen --pipelines rag_pretrained_web --limit 1
+```
+
+Override judges explicitly (evaluation + web validator):
+
+```powershell
+.\.venv\Scripts\python main.py --judge-provider openrouter --judge-model kimi-k2.5:cloud --web-judge-provider openrouter --web-judge-model kimi-k2.5:cloud --models qwen --pipelines rag_pretrained_web --limit 1
 ```
 
 Run tests:
@@ -95,9 +107,9 @@ You can switch judges at runtime with flags:
 
 - `embeddings.model` (active)
 - `embeddings.provider` (`ollama` or `sentence_transformers`)
-- `embeddings.recommended_models.quality` (`BAAI/bge-m3`)
-- `embeddings.recommended_models.balanced` (`all-mpnet-base-v2`)
-- `embeddings.recommended_models.fast` (`all-MiniLM-L6-v2`)
+- `embeddings.recommended_models.quality` (`nomic-embed-text`)
+- `embeddings.recommended_models.balanced` (`sentence-transformers/all-mpnet-base-v2`)
+- `embeddings.recommended_models.fast` (`sentence-transformers/all-MiniLM-L6-v2`)
 
 Current default is `ollama + nomic-embed-text`.
 
@@ -105,6 +117,12 @@ Current default is `ollama + nomic-embed-text`.
 
 ```powershell
 .\.venv\Scripts\python -m pip show chromadb pyyaml rank-bm25 duckduckgo-search openpyxl
+```
+
+Check UI dependency:
+
+```powershell
+.\.venv\Scripts\python -m pip show streamlit
 ```
 
 ## Run everything
@@ -133,12 +151,32 @@ Run everything with a question limit (fast validation):
 .\scripts\run_everything.ps1 -Limit 1
 ```
 
+Run everything on train/test/both split:
+
+```powershell
+.\scripts\run_everything.ps1 -EvalSplit test
+.\scripts\run_everything.ps1 -EvalSplit train
+.\scripts\run_everything.ps1 -EvalSplit both
+```
+
+Run everything with Kimi Cloud judge:
+
+```powershell
+.\scripts\run_everything.ps1 -UseKimiCloudJudge -Limit 1
+```
+
 ## Reviewer UI
 
 Run the Streamlit reviewer UI:
 
 ```powershell
 .\scripts\run_ui.ps1
+```
+
+Open UI for a specific progress file:
+
+```powershell
+.\scripts\run_ui.ps1 -ProgressFile outputs\progress\run_progress_YYYYMMDD_HHMMSS.json
 ```
 
 Open the URL printed by Streamlit (usually `http://localhost:8501`).
