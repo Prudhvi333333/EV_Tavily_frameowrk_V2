@@ -73,6 +73,11 @@ def _parse_args() -> argparse.Namespace:
         help="Disable web document reranking.",
     )
     parser.add_argument(
+        "--extra-test-questions",
+        default=None,
+        help="Optional path (xlsx/csv) of extra test questions to append at runtime.",
+    )
+    parser.add_argument(
         "--enable-ragatouille-reranker",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -235,6 +240,8 @@ async def run_single_pipeline(
         web_low_confidence = 0
         web_rejected = 0
         web_timed_out = False
+        web_fallback_used = False
+        web_fallback_source = ""
         if pipeline_mode == PipelineMode.RAG_PRETRAINED_WEB:
             try:
                 q_id_label = f"Q_{int(float(q_id)):03d}"
@@ -249,6 +256,8 @@ async def run_single_pipeline(
             web_validation_records = list(crawl_payload.get("records", []))
             web_search_query = str(crawl_payload.get("search_query", ""))
             web_timed_out = bool(crawl_payload.get("timed_out", False))
+            web_fallback_used = bool(crawl_payload.get("fallback_used", False))
+            web_fallback_source = str(crawl_payload.get("fallback_source", ""))
             web_accepted = sum(1 for r in web_validation_records if r.get("accepted"))
             web_low_confidence = sum(1 for r in web_validation_records if r.get("low_confidence"))
             web_rejected = sum(1 for r in web_validation_records if not r.get("accepted"))
@@ -257,7 +266,10 @@ async def run_single_pipeline(
                 max_web_chars = int(config.get("crawler", {}).get("max_web_context_chars", 3200))
                 if len(web_context) > max_web_chars:
                     web_context = web_context[:max_web_chars].rsplit(" ", 1)[0].rstrip() + " ..."
-                web_status = "PARTIAL_TIMEOUT_OK" if web_timed_out else "OK"
+                if web_fallback_used:
+                    web_status = "TAVILY_ANSWER_FALLBACK"
+                else:
+                    web_status = "PARTIAL_TIMEOUT_OK" if web_timed_out else "OK"
             elif web_validation_records:
                 web_status = "PARTIAL_TIMEOUT_NO_ACCEPTED" if web_timed_out else "REJECTED_ALL"
             else:
@@ -281,6 +293,8 @@ async def run_single_pipeline(
                 "web_status": web_status,
                 "web_search_query": web_search_query,
                 "web_timed_out": web_timed_out,
+                "web_fallback_used": web_fallback_used,
+                "web_fallback_source": web_fallback_source,
                 "web_docs_selected": web_docs,
                 "web_validation_records": web_validation_records,
                 "web_accepted_count": web_accepted,
@@ -323,6 +337,9 @@ async def main() -> None:
     if args.retrieval_backend:
         config.setdefault("retrieval", {})
         config["retrieval"]["backend"] = args.retrieval_backend
+    if args.extra_test_questions:
+        config.setdefault("paths", {})
+        config["paths"]["extra_test_questions"] = str(args.extra_test_questions)
     if args.enable_reranker or args.enable_ragatouille_reranker:
         config.setdefault("reranker", {})
         config["reranker"]["enabled"] = True

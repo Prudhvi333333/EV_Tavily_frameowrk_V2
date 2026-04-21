@@ -13,6 +13,7 @@ paths:
   questions_input: data/questions/questions_master.xlsx
   train_questions: data/questions/train_questions.xlsx
   test_questions: data/questions/test_questions.xlsx
+  extra_test_questions: ""
   web_cache_dir: data/web_cache
   chroma_dir: outputs/chroma_db
   reports_dir: outputs/reports
@@ -115,6 +116,12 @@ crawler:
   crawl_provider: firecrawl
   tavily_api_key_env: TAVILY_API_KEY
   firecrawl_api_key_env: FIRECRAWL_API_KEY
+  tavily_answer_fallback:
+    enabled: true
+    max_retries: 2
+    retry_backoff_sec: 1.5
+    search_depth: advanced
+    max_results: 5
   metadata_filtering:
     enabled: true
     registry_path: rag_data_management_registry.xlsx

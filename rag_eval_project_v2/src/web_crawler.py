@@ -551,6 +551,12 @@ class WebCrawler:
         self.tavily_timeout = float(crawler_cfg.get("tavily_timeout", 75))
         self.tavily_max_retries = max(int(crawler_cfg.get("tavily_max_retries", 3)), 1)
         self.tavily_retry_backoff_sec = max(float(crawler_cfg.get("tavily_retry_backoff_sec", 2.0)), 0.1)
+        fallback_cfg = dict(crawler_cfg.get("tavily_answer_fallback", {}))
+        self.tavily_answer_fallback_enabled = bool(fallback_cfg.get("enabled", True))
+        self.tavily_answer_max_retries = max(int(fallback_cfg.get("max_retries", 2)), 1)
+        self.tavily_answer_retry_backoff_sec = max(float(fallback_cfg.get("retry_backoff_sec", 1.5)), 0.1)
+        self.tavily_answer_search_depth = str(fallback_cfg.get("search_depth", "advanced")).strip() or "advanced"
+        self.tavily_answer_max_results = max(int(fallback_cfg.get("max_results", 5)), 1)
         self.firecrawl_max_retries = max(int(crawler_cfg.get("firecrawl_max_retries", 2)), 1)
         self.firecrawl_retry_backoff_sec = max(float(crawler_cfg.get("firecrawl_retry_backoff_sec", 1.5)), 0.1)
         self.fail_on_search_error = bool(crawler_cfg.get("fail_on_search_error", False))
@@ -644,7 +650,15 @@ class WebCrawler:
             except Exception:
                 self.logger.warning("Web cache read failed for %s; rebuilding.", question[:80])
 
-        result_payload = {"docs": [], "records": [], "search_query": "", "timed_out": False}
+        result_payload = {
+            "docs": [],
+            "records": [],
+            "search_query": "",
+            "timed_out": False,
+            "fallback_used": False,
+            "fallback_source": "",
+            "fallback_answer": "",
+        }
         accepted_docs: list[dict[str, Any]] = []
         validation_records: list[dict[str, Any]] = []
         try:
@@ -656,12 +670,23 @@ class WebCrawler:
                 except Exception as exc:
                     self.logger.warning("Tavily search failed for question '%s': %s", question[:100], exc)
                     result_payload["search_error"] = f"{type(exc).__name__}:{exc}"
-                    if self.cache_enabled:
-                        with cache_path.open("w", encoding="utf-8") as f:
-                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                    result_payload = await self._maybe_add_tavily_answer_fallback(
+                        question=question,
+                        search_query=search_query,
+                        result_payload=result_payload,
+                        validation_records=validation_records,
+                    )
+                    self._write_cache(cache_path, result_payload)
                     return result_payload
                 if not search_results:
                     self.logger.warning("No Tavily search results for question: %s", question[:100])
+                    result_payload = await self._maybe_add_tavily_answer_fallback(
+                        question=question,
+                        search_query=search_query,
+                        result_payload=result_payload,
+                        validation_records=validation_records,
+                    )
+                    self._write_cache(cache_path, result_payload)
                     return result_payload
 
                 try:
@@ -711,9 +736,13 @@ class WebCrawler:
                 result_payload["records"] = list(validation_records)
                 if not search_results:
                     self.logger.warning("All Tavily candidates rejected by metadata policy for question: %s", question[:100])
-                    if self.cache_enabled:
-                        with cache_path.open("w", encoding="utf-8") as f:
-                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                    result_payload = await self._maybe_add_tavily_answer_fallback(
+                        question=question,
+                        search_query=search_query,
+                        result_payload=result_payload,
+                        validation_records=validation_records,
+                    )
+                    self._write_cache(cache_path, result_payload)
                     return result_payload
 
                 for item in search_results:
@@ -830,17 +859,19 @@ class WebCrawler:
 
                 if not accepted_docs:
                     self.logger.warning("All web documents rejected for question: %s", question[:100])
-                    if self.cache_enabled:
-                        with cache_path.open("w", encoding="utf-8") as f:
-                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                    result_payload = await self._maybe_add_tavily_answer_fallback(
+                        question=question,
+                        search_query=search_query,
+                        result_payload=result_payload,
+                        validation_records=validation_records,
+                    )
+                    self._write_cache(cache_path, result_payload)
                     return result_payload
 
                 reranked = await self._rerank(question, accepted_docs)
                 result_payload["docs"] = reranked[: self.top_results]
 
-                if self.cache_enabled:
-                    with cache_path.open("w", encoding="utf-8") as f:
-                        json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                self._write_cache(cache_path, result_payload)
                 return result_payload
         except TimeoutError:
             self.logger.warning("Crawler timeout for question: %s", question[:100])
@@ -849,7 +880,129 @@ class WebCrawler:
             if accepted_docs:
                 accepted_docs.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
                 result_payload["docs"] = accepted_docs[: self.top_results]
+            if not result_payload["docs"]:
+                search_query_for_fallback = str(result_payload.get("search_query", "")).strip() or question
+                result_payload = await self._maybe_add_tavily_answer_fallback(
+                    question=question,
+                    search_query=search_query_for_fallback,
+                    result_payload=result_payload,
+                    validation_records=validation_records,
+                )
+            self._write_cache(cache_path, result_payload)
             return result_payload
+
+    def _write_cache(self, cache_path: Path, payload: dict[str, Any]) -> None:
+        if not self.cache_enabled:
+            return
+        try:
+            with cache_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            self.logger.warning("Web cache write failed for %s: %s", cache_path.name, exc)
+
+    async def _maybe_add_tavily_answer_fallback(
+        self,
+        question: str,
+        search_query: str,
+        result_payload: dict[str, Any],
+        validation_records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result_payload["records"] = list(validation_records)
+        if not self.tavily_answer_fallback_enabled:
+            return result_payload
+        if result_payload.get("docs"):
+            return result_payload
+
+        query = str(search_query or question).strip()
+        answer = await self._tavily_qna_search(query)
+        if not answer:
+            return result_payload
+
+        answer_text = answer.strip()
+        fallback_doc = {
+            "url": "tavily://qna_search",
+            "source_domain": "tavily_qna_search",
+            "text": answer_text,
+            "confidence": 0.0,
+            "low_confidence": True,
+            "context_block": self._tavily_answer_context_block(answer_text),
+            "signals": {
+                "s1_keyword": 0.0,
+                "s2_semantic": 0.0,
+                "s3_llm": 0.0,
+                "s3_partial_relevance": 0.0,
+            },
+            "decision": "ACCEPTED_TAVILY_ANSWER_FALLBACK",
+            "rerank_score": None,
+        }
+        result_payload["docs"] = [fallback_doc]
+        result_payload["fallback_used"] = True
+        result_payload["fallback_source"] = "tavily_qna_search"
+        result_payload["fallback_answer"] = answer_text
+
+        validation_records.append(
+            {
+                "url": "tavily://qna_search",
+                "source_domain": "tavily_qna_search",
+                "decision": "ACCEPTED_TAVILY_ANSWER_FALLBACK",
+                "accepted": True,
+                "low_confidence": True,
+                "final_score": 0.0,
+                "signals": {
+                    "s1_keyword": 0.0,
+                    "s2_semantic": 0.0,
+                    "s3_llm": 0.0,
+                    "s3_partial_relevance": 0.0,
+                },
+                "s3_reason": "tavily_answer_fallback",
+                "text_preview": answer_text[:240],
+            }
+        )
+        result_payload["records"] = list(validation_records)
+        self.logger.info("Using Tavily answer fallback for question: %s", question[:100])
+        return result_payload
+
+    async def _tavily_qna_search(self, query: str) -> str:
+        if self._tavily_client is None:
+            return ""
+        q = str(query or "").strip()
+        if not q:
+            return ""
+
+        def _run() -> str:
+            answer = self._tavily_client.qna_search(
+                query=q,
+                search_depth=self.tavily_answer_search_depth,
+                max_results=self.tavily_answer_max_results,
+                timeout=self.tavily_timeout,
+            )
+            return str(answer or "").strip()
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.tavily_answer_max_retries + 1):
+            try:
+                return await asyncio.to_thread(_run)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self.tavily_answer_max_retries:
+                    wait_s = self.tavily_answer_retry_backoff_sec * attempt
+                    self.logger.warning(
+                        "Tavily answer fallback attempt %s/%s failed for query '%s': %s. Retrying in %.1fs",
+                        attempt,
+                        self.tavily_answer_max_retries,
+                        q[:90],
+                        exc,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+        self.logger.warning(
+            "Tavily answer fallback failed after %s attempts for query '%s': %s",
+            self.tavily_answer_max_retries,
+            q[:90],
+            last_exc,
+        )
+        return ""
 
     async def _search_tavily(self, query: str) -> list[dict[str, str]]:
         if self._tavily_client is None:
@@ -1048,6 +1201,9 @@ class WebCrawler:
         else:
             header = f"[WEB | confidence: {result.final_score:.3f} | source: {result.source_domain}]"
         return f"{header}\n{text.strip()}"
+
+    def _tavily_answer_context_block(self, answer_text: str) -> str:
+        return f"[WEB_FALLBACK | source: tavily_qna_search | LOW_CONFIDENCE]\n{answer_text.strip()}"
 
     def _cache_path(self, question: str) -> Path:
         digest = hashlib.sha256(question.strip().casefold().encode("utf-8")).hexdigest()

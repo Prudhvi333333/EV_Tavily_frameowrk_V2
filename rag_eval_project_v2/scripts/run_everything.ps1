@@ -7,6 +7,7 @@ param(
   [switch]$UseKimiCloudJudge,
   [ValidateSet("hybrid", "llamaindex")]
   [string]$RetrievalBackend = "llamaindex",
+  [string]$ExtraTestQuestions = "",
   [Alias("EnableRAGatouilleReranker")]
   [switch]$EnableReranker,
   [Alias("DisableRAGatouilleReranker")]
@@ -388,6 +389,9 @@ if ($EnableWebReranker) {
 }
 if ($DisableWebReranker) {
   $cmdArgs += @("--disable-web-reranker")
+}
+if (-not [string]::IsNullOrWhiteSpace($ExtraTestQuestions)) {
+  $cmdArgs += @("--extra-test-questions", $ExtraTestQuestions)
 }
 
 Write-Host "Running main pipeline..."

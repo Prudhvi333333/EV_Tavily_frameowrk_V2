@@ -79,6 +79,12 @@ Run train split, test split, or both:
 .\.venv\Scripts\python main.py --eval-split both --models qwen --pipelines rag_pretrained_web --retrieval-backend llamaindex
 ```
 
+Run with extra test questions (keeps train=35 unchanged, appends extra rows to test at runtime):
+
+```powershell
+.\.venv\Scripts\python main.py --eval-split test --extra-test-questions data\questions\test_questions_extra.xlsx --models qwen --pipelines rag_pretrained_web --retrieval-backend llamaindex
+```
+
 Use Kimi Cloud judge via Ollama cloud model:
 
 ```powershell
@@ -101,6 +107,12 @@ Run tests:
 
 ```powershell
 .\.venv\Scripts\python -m pytest -q
+```
+
+Run focused tests for newly added features:
+
+```powershell
+.\.venv\Scripts\python -m pytest -q tests\test_web_crawler_resilience.py::test_tavily_answer_fallback_is_used_and_cached tests\test_splitter_extra_test_questions.py
 ```
 
 Run train tuning:
@@ -224,6 +236,12 @@ Run everything on train/test/both split:
 .\scripts\run_everything.ps1 -EvalSplit both -RetrievalBackend llamaindex
 ```
 
+Run everything with extra test questions appended at runtime:
+
+```powershell
+.\scripts\run_everything.ps1 -EvalSplit test -RetrievalBackend llamaindex -ExtraTestQuestions data\questions\test_questions_extra.xlsx
+```
+
 Run everything with Kimi Cloud judge:
 
 ```powershell
@@ -330,6 +348,24 @@ Behavior:
 - Applies configured domain blocklist/allowlist and score thresholds
 - Logs policy rejections into web validation proof flow
 
+## Tavily answer fallback (no-docs case)
+
+If Tavily + scrape/validation cannot produce accepted documents, crawler can ask Tavily for a direct answer and inject it as low-confidence web context.
+
+Config (`config/config.yaml`):
+
+- `crawler.tavily_answer_fallback.enabled`
+- `crawler.tavily_answer_fallback.max_retries`
+- `crawler.tavily_answer_fallback.retry_backoff_sec`
+- `crawler.tavily_answer_fallback.search_depth`
+- `crawler.tavily_answer_fallback.max_results`
+
+Behavior:
+
+- Triggered only when no web docs are accepted
+- Uses Tavily `qna_search`
+- Stores fallback answer in normal question cache (`data/web_cache/<hash>.json`) so repeated questions reuse cached fallback answer without calling Tavily again
+
 ## How Train/Test Split Works
 
 - Master file: `data/questions/questions_master.xlsx`
@@ -341,6 +377,10 @@ Behavior:
 - First split generation writes:
   - `data/questions/train_questions.xlsx`
   - `data/questions/test_questions.xlsx`
+- Optional runtime-only test extension:
+  - set `paths.extra_test_questions` in config, or pass `--extra-test-questions <xlsx/csv>`
+  - extra rows are appended to test split after dedupe by normalized question text
+  - missing fields are auto-filled: `Use Case Category=Extra Test`, `Human validated answers=""`, and auto `Num`
 - Subsequent runs reuse those files for stable comparison.
 - `--eval-split` controls what you evaluate:
   - `train`: tuning/diagnostics split
