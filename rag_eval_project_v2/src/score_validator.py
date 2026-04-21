@@ -17,6 +17,8 @@ class ScoreValidator:
         self.base_url = str(validator_cfg.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/")
         self.api_key_env = str(validator_cfg.get("api_key_env", "OPENROUTER_API_KEY"))
         self.flag_threshold = float(validator_cfg.get("flag_threshold", 0.3))
+        keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
+        ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
         if self.provider in {"openrouter", "kimi_cloud", "kimi"}:
             self.local_qwen = OpenRouterGenerator(
                 self.model,
@@ -25,7 +27,12 @@ class ScoreValidator:
                 strict=bool(config.get("runtime", {}).get("strict_mode", False)),
             )
         else:
-            self.local_qwen = OllamaGenerator(self.model, strict=bool(config.get("runtime", {}).get("strict_mode", False)))
+            self.local_qwen = OllamaGenerator(
+                self.model,
+                strict=bool(config.get("runtime", {}).get("strict_mode", False)),
+                keep_alive=keep_alive,
+                options=ollama_options,
+            )
         eval_cfg = config.get("evaluation", {})
         self.weight_sets = {
             "rag": eval_cfg.get("weights_rag", {}),
@@ -137,7 +144,11 @@ class ScoreValidator:
             lines = [x.strip() for x in answer.splitlines() if x.strip()]
             if not lines:
                 return 0.0
-            tagged = sum(1 for x in lines if any(t in x for t in ("[KB]", "[PRETRAINED]", "[WEB]")))
+            tags = tuple(
+                t.casefold()
+                for t in ("[KB]", "[PRETRAINED]", "[WEB]", "kb", "context", "web", "pretrained", "general knowledge")
+            )
+            tagged = sum(1 for x in lines if any(t in x.casefold() for t in tags))
             return round(tagged / len(lines), 4)
         return 0.5
 

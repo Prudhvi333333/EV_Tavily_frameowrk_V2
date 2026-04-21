@@ -44,6 +44,14 @@ def test_parse_judge_response_strict_json() -> None:
     assert "Georgia EV supply chain" in reason
 
 
+def test_parse_judge_response_accepts_prefixed_json_payload() -> None:
+    response = 'Result: {"score": 6, "partial_relevance": 0.4, "reason": "Partially relevant."}'
+    score, partial, reason = parse_judge_response(response, strict_mode=True)
+    assert score == 0.6
+    assert partial == 0.4
+    assert reason == "Partially relevant."
+
+
 def test_document_validator_accepts_low_and_rejects() -> None:
     cfg = {
         "runtime": {"strict_mode": True},

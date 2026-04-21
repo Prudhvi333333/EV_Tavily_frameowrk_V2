@@ -11,7 +11,7 @@ import chromadb
 import numpy as np
 from rank_bm25 import BM25Okapi
 
-from src.utils.embeddings import load_embedder_from_config
+from src.utils.embeddings import encode_for_task, load_embedder_from_config
 from src.utils.config_loader import resolve_path
 from src.utils.logger import get_logger
 
@@ -40,7 +40,13 @@ def build_or_load_index(config: dict[str, Any], documents: list[dict[str, Any]])
     ids = [d["id"] for d in documents]
     texts = [d["text"] for d in documents]
     metadatas = [d["metadata"] for d in documents]
-    probe_vec = embedder.encode([texts[0]], normalize_embeddings=True, convert_to_numpy=True)[0]
+    probe_vec = encode_for_task(
+        embedder,
+        [texts[0]],
+        task="document",
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )[0]
     embedding_dim = int(len(probe_vec))
 
     embed_manifest_path = Path(progress_dir) / "embedding_manifest.json"
@@ -48,6 +54,11 @@ def build_or_load_index(config: dict[str, Any], documents: list[dict[str, Any]])
         "provider": str(config.get("embeddings", {}).get("provider", "sentence_transformers")),
         "model": str(config.get("embeddings", {}).get("model", "")),
         "dim": embedding_dim,
+        "instruction_prefixes": dict(
+            config.get("embeddings", {}).get("instruction_prefixes", {})
+            if isinstance(config.get("embeddings", {}).get("instruction_prefixes", {}), dict)
+            else {}
+        ),
     }
     previous_manifest = {}
     if embed_manifest_path.exists():
@@ -77,7 +88,13 @@ def build_or_load_index(config: dict[str, Any], documents: list[dict[str, Any]])
 
     if collection.count() == 0:
         logger.info("Building fresh Chroma index for %s documents.", len(documents))
-        vectors = embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        vectors = encode_for_task(
+            embedder,
+            texts,
+            task="document",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
         collection.add(ids=ids, embeddings=vectors.tolist(), documents=texts, metadatas=metadatas)
     else:
         logger.info("Using existing Chroma index with %s documents.", collection.count())

@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import numpy as np
 
+from src.utils.ollama import resolve_ollama_base_url
 
 METRIC_SETS: dict[str, list[str]] = {
     "rag": [
@@ -49,11 +50,14 @@ class RAGASEvaluator:
         provider = str(judge_cfg.get("provider", "openrouter")).lower()
         self.judge_provider = "openrouter" if provider in {"openrouter", "kimi_cloud", "kimi"} else provider
         self.judge_model = judge_cfg.get("model", "moonshotai/kimi-k2")
-        self.ollama_base_url = str(judge_cfg.get("ollama_base_url", "http://localhost:11434")).rstrip("/")
+        self.ollama_base_url = resolve_ollama_base_url(judge_cfg.get("ollama_base_url"))
         self.judge_base_url = judge_cfg.get("base_url", "https://openrouter.ai/api/v1").rstrip("/")
         self.judge_api_key = os.getenv(judge_cfg.get("api_key_env", "OPENROUTER_API_KEY"), "").strip()
         self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
+        self.ollama_keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
+        self.ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
         self.allow_heuristic_fallback = bool(eval_cfg.get("allow_heuristic_fallback", True))
+        self._last_judge_debug = ""
         self._judge_checked = False
         self._judge_available = False
         self.weight_sets = {
@@ -104,9 +108,13 @@ class RAGASEvaluator:
                 judged = await self._judge_with_openrouter(row, pipeline, metrics)
             if judged is not None:
                 return judged
+            debug_hint = f" Last judge output/error: {self._last_judge_debug}" if self._last_judge_debug else ""
+        else:
+            debug_hint = f" Last judge output/error: {self._last_judge_debug}" if self._last_judge_debug else ""
         if self.strict_mode and not self.allow_heuristic_fallback:
             raise RuntimeError(
                 "Judge is unavailable or returned invalid output, and heuristic fallback is disabled."
+                + debug_hint
             )
         return self._heuristic_scores(row, pipeline, metrics)
 
@@ -176,14 +184,18 @@ class RAGASEvaluator:
             "system": "Return only JSON.",
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0},
+            "format": "json",
+            "options": {**self.ollama_options, "temperature": 0},
         }
+        if self.ollama_keep_alive:
+            payload["keep_alive"] = self.ollama_keep_alive
         try:
             timeout = httpx.Timeout(connect=5.0, read=120.0, write=20.0, pool=5.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(f"{self.ollama_base_url}/api/generate", json=payload)
                 resp.raise_for_status()
             content = str(resp.json().get("response", "")).strip()
+            self._last_judge_debug = content[:300]
             obj = self._parse_json_object(content)
             if not obj:
                 return None
@@ -192,7 +204,8 @@ class RAGASEvaluator:
                 val = float(obj.get(metric, 0.0))
                 cleaned[metric] = max(0.0, min(1.0, val))
             return cleaned
-        except Exception:
+        except Exception as exc:
+            self._last_judge_debug = f"ollama_error:{type(exc).__name__}:{exc}"
             return None
 
     async def _judge_with_openrouter(
@@ -237,6 +250,7 @@ class RAGASEvaluator:
                 .get("content", "")
                 .strip()
             )
+            self._last_judge_debug = content[:300]
             obj = self._parse_json_object(content)
             if not obj:
                 return None
@@ -245,7 +259,8 @@ class RAGASEvaluator:
                 val = float(obj.get(metric, 0.0))
                 cleaned[metric] = max(0.0, min(1.0, val))
             return cleaned
-        except Exception:
+        except Exception as exc:
+            self._last_judge_debug = f"openrouter_error:{type(exc).__name__}:{exc}"
             return None
 
     def _parse_json_object(self, text: str) -> dict[str, Any] | None:
@@ -253,19 +268,12 @@ class RAGASEvaluator:
             return None
         text = text.strip()
         if text.startswith("```"):
-            text = text.strip("`")
-            if "json" in text[:10]:
-                text = text[text.find("\n") + 1 :]
+            lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
+            text = "\n".join(lines).strip()
         try:
             return json.loads(text)
         except Exception:
-            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if not match:
-                return None
-            try:
-                return json.loads(match.group(0))
-            except Exception:
-                return None
+            return None
 
     def _heuristic_scores(
         self,
@@ -306,10 +314,11 @@ class RAGASEvaluator:
         if not lines:
             return 0.0
         if pipeline == "rag_pretrained":
-            tags = ("[KB]", "[PRETRAINED]")
+            tags = ("[KB]", "[PRETRAINED]", "kb", "context", "pretrained", "general knowledge")
         else:
-            tags = ("[KB]", "[PRETRAINED]", "[WEB]")
-        tagged = sum(1 for ln in lines if any(t in ln for t in tags))
+            tags = ("[KB]", "[PRETRAINED]", "[WEB]", "kb", "context", "web", "pretrained", "general knowledge")
+        tags_norm = tuple(t.casefold() for t in tags)
+        tagged = sum(1 for ln in lines if any(t in ln.casefold() for t in tags_norm))
         return round(tagged / len(lines), 4)
 
     def _overlap(self, left: str, right: str, mode: str = "f1") -> float:

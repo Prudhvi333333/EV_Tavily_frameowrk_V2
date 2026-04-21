@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
-from src.utils.embeddings import load_embedder_from_config
+from src.utils.embeddings import encode_for_task, load_embedder_from_config
 
 
 class FewShotBuilder:
@@ -16,12 +16,24 @@ class FewShotBuilder:
         self.config = config
         self.embedder = load_embedder_from_config(config)
         self.train_questions = self.train_df["Question"].astype(str).tolist()
-        self.train_vectors = self.embedder.encode(self.train_questions, normalize_embeddings=True)
+        self.train_vectors = encode_for_task(
+            self.embedder,
+            self.train_questions,
+            task="query",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
 
     def get_examples(self, question: str, pipeline_mode: str, n: int = 2) -> str:
         if len(self.train_df) == 0 or n <= 0:
             return ""
-        query_vec = self.embedder.encode([question], normalize_embeddings=True)
+        query_vec = encode_for_task(
+            self.embedder,
+            [question],
+            task="query",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
         sims = cosine_similarity(query_vec, self.train_vectors)[0]
         q_norm = " ".join(question.casefold().split())
         ranked = np.argsort(sims)[::-1].tolist()
@@ -35,8 +47,7 @@ class FewShotBuilder:
             if " ".join(q.casefold().split()) == q_norm:
                 continue
             a = str(row["Human validated answers"])
-            if pipeline_mode in {"rag", "rag_pretrained", "rag_pretrained_web"}:
-                a = self._format_rag_template(a)
+            a = self._prepare_example_answer(a, pipeline_mode=pipeline_mode)
             blocks.append(f"Example {counter}:\nQuestion: {q}\nAnswer: {a}")
             counter += 1
         return "\n\n".join(blocks)
@@ -49,14 +60,24 @@ class FewShotBuilder:
         return "There are N companies: [formatted list follows]."
 
     def _format_rag_template(self, golden_answer: str) -> str:
-        lines = [x.strip() for x in golden_answer.splitlines() if x.strip()]
+        return self._prepare_example_answer(golden_answer, pipeline_mode="rag")
+
+    def _prepare_example_answer(self, golden_answer: str, pipeline_mode: str) -> str:
+        raw = str(golden_answer or "").strip()
+        if not raw:
+            return "No validated answer available."
+
+        lines = [x.strip() for x in raw.splitlines() if x.strip()]
         if not lines:
-            return "Answer with grounded bullet points and clear source-based statements."
-        has_list = any("|" in ln for ln in lines)
-        if has_list:
-            return (
-                "There are N matching entities.\n"
-                "1) <Company> [<Tier>] | Role: <EV Supply Chain Role> | Product: <Product / Service>\n"
-                "2) <Company> [<Tier>] | Role: <EV Supply Chain Role> | Product: <Product / Service>"
-            )
-        return "Provide a concise factual answer and explicitly mention uncertainty when context is missing."
+            return raw
+
+        has_structured_list = any("|" in ln for ln in lines)
+        max_lines = 6 if has_structured_list else 4
+        selected = lines[:max_lines]
+        text = "\n".join(selected)
+
+        # Keep examples concise to prevent prompt bloat while preserving real factual content.
+        limit = 1100 if pipeline_mode in {"rag", "rag_pretrained", "rag_pretrained_web"} else 900
+        if len(text) > limit:
+            text = text[:limit].rsplit(" ", 1)[0].rstrip() + " ..."
+        return text

@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG Eval v2 | Code Flow & Framework Architecture</title>
+  <style>
+    :root {
+      --bg: #f3f8ff;
+      --card: #ffffff;
+      --ink: #17324a;
+      --muted: #4f677b;
+      --line: #d7e4ef;
+      --ok: #0f8a66;
+      --warn: #b47300;
+      --bad: #b03a3a;
+      --accent: #1f6fd8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background:
+        radial-gradient(circle at 12% -10%, #d5edf7 0, transparent 34%),
+        radial-gradient(circle at 90% 0%, #dce7ff 0, transparent 32%),
+        var(--bg);
+      color: var(--ink);
+    }
+    .wrap {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 18px;
+    }
+    .hero {
+      border: 1px solid #b9d3eb;
+      border-radius: 14px;
+      padding: 18px;
+      background: linear-gradient(120deg, #0f7f6c, #1f6fd8 54%, #2986ca);
+      color: #f8fcff;
+      box-shadow: 0 10px 24px rgba(20, 47, 78, 0.17);
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: 1.45rem;
+      letter-spacing: 0.1px;
+    }
+    .hero p {
+      margin: 8px 0 0;
+      color: #e1f1fd;
+    }
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 5px 14px rgba(25, 51, 75, 0.08);
+    }
+    h2 {
+      margin: 2px 0 8px;
+      font-size: 1.05rem;
+    }
+    .pill {
+      display: inline-block;
+      font-size: 0.75rem;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      border: 1px solid transparent;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }
+    .ok { background: #e9f9f2; color: var(--ok); border-color: #bfe9d8; }
+    .warn { background: #fff6e4; color: var(--warn); border-color: #efd59c; }
+    .bad { background: #fff0ef; color: var(--bad); border-color: #f2c5c2; }
+    .muted { color: var(--muted); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #eef5fb;
+      font-weight: 700;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+    }
+    .step {
+      border: 1px solid #cde0ee;
+      background: linear-gradient(180deg, #fff, #f8fcff);
+      border-radius: 10px;
+      padding: 10px;
+      min-height: 126px;
+    }
+    .step .t {
+      font-size: 0.8rem;
+      color: #4a6277;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      font-weight: 700;
+    }
+    .step .v {
+      margin-top: 6px;
+      font-weight: 700;
+      color: #20435f;
+    }
+    code {
+      background: #edf4fb;
+      border: 1px solid #d8e4f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+      font-size: 0.82rem;
+    }
+    ul {
+      margin: 6px 0 0;
+      padding-left: 18px;
+    }
+    .small {
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    .subgrid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    @media (max-width: 1050px) {
+      .grid-3, .grid-2, .flow, .subgrid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>RAG Evaluation v2: Code Flow, Frameworks, and Metadata Policy</h1>
+      <p>Production-facing architecture snapshot for reviewers and engineering handoff.</p>
+    </section>
+
+    <section class="grid-3">
+      <div class="card">
+        <h2>Current Runtime Status</h2>
+        <span class="pill ok">LlamaIndex Retrieval: Enabled</span>
+        <span class="pill ok">KB Reranker: Enabled (config default)</span>
+        <span class="pill ok">Web Reranker: Enabled (config default)</span>
+        <p class="small">Source of truth: <code>config/config.yaml</code>, <code>main.py</code> runtime overrides.</p>
+      </div>
+      <div class="card">
+        <h2>3-Question Evidence (Historical)</h2>
+        <span class="pill warn">Quick Run Used --limit=3</span>
+        <span class="pill bad">reranker.enabled=False in that run</span>
+        <p class="small">Log evidence: <code>outputs/logs/main_20260421_184738.log</code> shows <code>reranker.enabled=False</code>.</p>
+      </div>
+      <div class="card">
+        <h2>Targeted Retrieval Fix Pass</h2>
+        <span class="pill warn">Planned Step (not auto-applied in that historical run)</span>
+        <p class="small">Meaning: a deliberate retrieval-quality improvement cycle across full split (train/test), then re-measure metrics. It was proposed as next work, not silently applied.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>End-to-End Flow</h2>
+      <div class="flow">
+        <div class="step">
+          <div class="t">Input</div>
+          <div class="v">Questions + KB</div>
+          <ul>
+            <li>Load split from Excel (train/test)</li>
+            <li>Load KB master rows</li>
+            <li>Build/attach Chroma index</li>
+          </ul>
+        </div>
+        <div class="step">
+          <div class="t">Retrieval</div>
+          <div class="v">Hybrid + LlamaIndex</div>
+          <ul>
+            <li>Query intent detection</li>
+            <li>Semantic (LlamaIndex over Chroma)</li>
+            <li>BM25 lexical blend</li>
+            <li>Metadata boost (tier/location/role)</li>
+          </ul>
+        </div>
+        <div class="step">
+          <div class="t">Rerank</div>
+          <div class="v">Cross-Encoder</div>
+          <ul>
+            <li>KB reranker: <code>cross-encoder/ms-marco-MiniLM-L6-v2</code></li>
+            <li>Optional web rerank over accepted web docs</li>
+          </ul>
+        </div>
+        <div class="step">
+          <div class="t">Generation</div>
+          <div class="v">Qwen Pipelines</div>
+          <ul>
+            <li><code>rag</code>, <code>no_rag</code>, <code>rag_pretrained</code>, <code>rag_pretrained_web</code></li>
+            <li>Few-shot + CoT prompting controls</li>
+            <li>HyDE optional expansion</li>
+          </ul>
+        </div>
+        <div class="step">
+          <div class="t">Evaluation + UI</div>
+          <div class="v">Judge + Reports</div>
+          <ul>
+            <li>Metric scoring + validator</li>
+            <li>Excel outputs + comparison report</li>
+            <li>Dash reviewer UI + proof log</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>Frameworks by Responsibility</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Layer</th>
+              <th>Frameworks / Libraries</th>
+              <th>Usage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Vector Store</td>
+              <td>ChromaDB</td>
+              <td>Persistent embeddings and semantic retrieval store</td>
+            </tr>
+            <tr>
+              <td>Retrieval</td>
+              <td>LlamaIndex + rank-bm25</td>
+              <td>Semantic + lexical hybrid retrieval</td>
+            </tr>
+            <tr>
+              <td>Reranking</td>
+              <td>sentence-transformers CrossEncoder</td>
+              <td>KB candidate rerank and web candidate rerank</td>
+            </tr>
+            <tr>
+              <td>Generation/Judge Runtime</td>
+              <td>Ollama, OpenRouter (optional)</td>
+              <td>Qwen generation; Kimi judge paths</td>
+            </tr>
+            <tr>
+              <td>Web Acquisition</td>
+              <td>Tavily + Firecrawl</td>
+              <td>Search then scrape pipeline for web context</td>
+            </tr>
+            <tr>
+              <td>Data + Reporting</td>
+              <td>pandas + openpyxl</td>
+              <td>Excel reads/writes, report sheets</td>
+            </tr>
+            <tr>
+              <td>UI</td>
+              <td>Dash + Plotly</td>
+              <td>Reviewer dashboard (runs, questions, validation proofs)</td>
+            </tr>
+            <tr>
+              <td>Quality Gates</td>
+              <td>pytest</td>
+              <td>Module-level regression tests</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Tavily Metadata Filtering (Production Policy)</h2>
+        <div class="subgrid">
+          <div>
+            <span class="pill ok">Now Implemented</span>
+            <ul>
+              <li>Pre-scrape policy filter on Tavily candidates</li>
+              <li>Registry-driven domain blocklist from <code>Rejected_Documents</code> / <code>Failed_Acquisitions</code></li>
+              <li>Allowlist override from <code>Review_Ready.Final_Decision</code></li>
+              <li>Score thresholds: metadata and credibility</li>
+              <li>Policy rejections are logged in proof records</li>
+            </ul>
+          </div>
+          <div>
+            <span class="pill warn">Data Dependency</span>
+            <ul>
+              <li>Registry file: <code>rag_data_management_registry.xlsx</code></li>
+              <li>If policy is enabled and registry is missing, run fails fast</li>
+              <li>Config: <code>crawler.metadata_filtering.*</code></li>
+            </ul>
+          </div>
+        </div>
+        <p class="small">This filter runs before Firecrawl scrape, reducing wasted crawl calls on known-poor domains.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Pipeline Branches</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Pipeline</th>
+            <th>KB Retrieval</th>
+            <th>Web Flow</th>
+            <th>Typical Use</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>no_rag</code></td>
+            <td>No</td>
+            <td>No</td>
+            <td>Baseline model-only answer</td>
+          </tr>
+          <tr>
+            <td><code>rag</code></td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Grounded answer from KB only</td>
+          </tr>
+          <tr>
+            <td><code>rag_pretrained</code></td>
+            <td>Yes</td>
+            <td>No</td>
+            <td>Grounded answer with pretrained augmentation</td>
+          </tr>
+          <tr>
+            <td><code>rag_pretrained_web</code></td>
+            <td>Yes</td>
+            <td>Yes (Tavily → registry filter → Firecrawl → validation → web rerank)</td>
+            <td>High-coverage pipeline with external evidence</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+</body>
+</html>
+

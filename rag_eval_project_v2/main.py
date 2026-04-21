@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from src.evaluator import RAGASEvaluator
 from src.few_shot_builder import FewShotBuilder
-from src.generator import ModelGenerator, PipelineMode
+from src.generator import ModelGenerator, OllamaGenerator, PipelineMode
 from src.hyde import HyDEExpander
 from src.indexer import build_or_load_index
 from src.kb_loader import load_kb
@@ -46,6 +46,42 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-model", default=None, help="Override evaluation judge model.")
     parser.add_argument("--web-judge-provider", default=None, help="Override web validator judge provider.")
     parser.add_argument("--web-judge-model", default=None, help="Override web validator judge model.")
+    parser.add_argument(
+        "--retrieval-backend",
+        choices=["hybrid", "llamaindex"],
+        default=None,
+        help="Override retrieval backend.",
+    )
+    parser.add_argument(
+        "--enable-reranker",
+        action="store_true",
+        help="Enable cross-encoder reranker for KB retrieval.",
+    )
+    parser.add_argument(
+        "--disable-reranker",
+        action="store_true",
+        help="Disable reranker even if config enables it.",
+    )
+    parser.add_argument(
+        "--enable-web-reranker",
+        action="store_true",
+        help="Enable web document reranking.",
+    )
+    parser.add_argument(
+        "--disable-web-reranker",
+        action="store_true",
+        help="Disable web document reranking.",
+    )
+    parser.add_argument(
+        "--enable-ragatouille-reranker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--disable-ragatouille-reranker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
@@ -68,6 +104,88 @@ def _model_list(config: dict[str, Any], requested: list[str] | None) -> list[str
         return available
     req = [m for m in requested if m in available]
     return req or available
+
+
+def _probe_cross_encoder_model(model_name: str, local_files_only: bool, label: str) -> None:
+    try:
+        from sentence_transformers import CrossEncoder
+    except Exception as exc:
+        raise RuntimeError("sentence-transformers is required when rerankers are enabled.") from exc
+
+    try:
+        CrossEncoder(model_name, local_files_only=local_files_only)
+    except Exception as exc:
+        mode_hint = "cached locally" if local_files_only else "downloadable from HuggingFace"
+        raise RuntimeError(
+            f"Cross-encoder probe failed for {label} model '{model_name}'. "
+            f"Ensure the model is {mode_hint}."
+        ) from exc
+
+
+async def _probe_ollama_model(config: dict[str, Any], model_name: str, label: str) -> None:
+    runtime_cfg = config.get("runtime", {})
+    probe = OllamaGenerator(
+        model_name,
+        strict=True,
+        keep_alive=str(runtime_cfg.get("ollama_keep_alive", "0s")),
+        options=dict(runtime_cfg.get("ollama_options", {})),
+    )
+    out = await probe.generate(
+        prompt="Reply only: MODEL_OK",
+        system="Return the token only.",
+        temperature=0.0,
+    )
+    text = str(out or "").strip()
+    if not text:
+        raise RuntimeError(f"Ollama probe returned unexpected output for {label} model '{model_name}'.")
+
+
+async def _runtime_preflight(config: dict[str, Any], selected_models: list[str], logger: Any) -> None:
+    # Fail fast before indexing/evaluation when strict mode is enabled.
+    if not bool(config.get("runtime", {}).get("strict_mode", False)):
+        return
+
+    to_probe: list[tuple[str, str]] = []
+    for model_key in selected_models:
+        if model_key == "gemini":
+            continue
+        model_name = str(config.get("models", {}).get(model_key, "")).strip()
+        if model_name:
+            to_probe.append((model_name, f"generator:{model_key}"))
+
+    eval_judge = config.get("evaluation", {}).get("judge", {})
+    if str(eval_judge.get("provider", "ollama")).lower() == "ollama":
+        judge_model = str(eval_judge.get("model", "")).strip()
+        if judge_model:
+            to_probe.append((judge_model, "evaluation_judge"))
+
+    web_judge = config.get("web_validator", {}).get("judge", {})
+    if str(web_judge.get("provider", "ollama")).lower() == "ollama":
+        judge_model = str(web_judge.get("model", "")).strip()
+        if judge_model:
+            to_probe.append((judge_model, "web_judge"))
+
+    seen: set[str] = set()
+    for model_name, label in to_probe:
+        if model_name in seen:
+            continue
+        seen.add(model_name)
+        logger.info("Runtime preflight: probing %s model '%s'", label, model_name)
+        await _probe_ollama_model(config, model_name, label)
+
+    reranker_cfg = config.get("reranker", {})
+    if bool(reranker_cfg.get("enabled", False)):
+        rerank_model = str(reranker_cfg.get("model", "cross-encoder/ms-marco-MiniLM-L6-v2")).strip()
+        rerank_local_only = bool(reranker_cfg.get("local_files_only", True))
+        logger.info("Runtime preflight: probing kb reranker model '%s'", rerank_model)
+        _probe_cross_encoder_model(rerank_model, local_files_only=rerank_local_only, label="kb_reranker")
+
+    web_cfg = config.get("web_validator", {})
+    if bool(web_cfg.get("rerank_enabled", True)):
+        web_ce_model = str(config.get("embeddings", {}).get("cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L6-v2")).strip()
+        web_local_only = bool(web_cfg.get("cross_encoder_local_files_only", True))
+        logger.info("Runtime preflight: probing web reranker model '%s'", web_ce_model)
+        _probe_cross_encoder_model(web_ce_model, local_files_only=web_local_only, label="web_reranker")
 
 
 async def run_single_pipeline(
@@ -98,7 +216,12 @@ async def run_single_pipeline(
         }:
             search_text = await hyde.expand(q, intent)
             vector = hyde.get_search_vector(search_text)
-            docs = retriever.retrieve_with_vector(vector, question_text=q, top_k=config["retrieval"]["top_k"])
+            docs = retriever.retrieve_with_vector(
+                vector,
+                question_text=q,
+                top_k=config["retrieval"]["top_k"],
+                intent=intent,
+            )
             kb_context = retriever.build_context(docs)
         else:
             docs = []
@@ -131,6 +254,9 @@ async def run_single_pipeline(
             web_rejected = sum(1 for r in web_validation_records if not r.get("accepted"))
             if web_docs:
                 web_context = "\n\n".join([str(d.get("context_block", "")).strip() for d in web_docs if str(d.get("context_block", "")).strip()])
+                max_web_chars = int(config.get("crawler", {}).get("max_web_context_chars", 3200))
+                if len(web_context) > max_web_chars:
+                    web_context = web_context[:max_web_chars].rsplit(" ", 1)[0].rstrip() + " ..."
                 web_status = "PARTIAL_TIMEOUT_OK" if web_timed_out else "OK"
             elif web_validation_records:
                 web_status = "PARTIAL_TIMEOUT_NO_ACCEPTED" if web_timed_out else "REJECTED_ALL"
@@ -171,16 +297,16 @@ async def run_single_pipeline(
 async def main() -> None:
     run_started_utc = datetime.now(timezone.utc)
     args = _parse_args()
-    load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
+    load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=True)
     config = load_config(args.config)
     logger = get_logger("main", config)
 
     if args.use_kimi_cloud_judge:
         config.setdefault("evaluation", {}).setdefault("judge", {})
-        config["evaluation"]["judge"]["provider"] = "openrouter"
+        config["evaluation"]["judge"]["provider"] = "ollama"
         config["evaluation"]["judge"]["model"] = "kimi-k2.5:cloud"
         config.setdefault("web_validator", {}).setdefault("judge", {})
-        config["web_validator"]["judge"]["provider"] = "openrouter"
+        config["web_validator"]["judge"]["provider"] = "ollama"
         config["web_validator"]["judge"]["model"] = "kimi-k2.5:cloud"
     if args.judge_provider:
         config.setdefault("evaluation", {}).setdefault("judge", {})
@@ -194,6 +320,21 @@ async def main() -> None:
     if args.web_judge_model:
         config.setdefault("web_validator", {}).setdefault("judge", {})
         config["web_validator"]["judge"]["model"] = args.web_judge_model
+    if args.retrieval_backend:
+        config.setdefault("retrieval", {})
+        config["retrieval"]["backend"] = args.retrieval_backend
+    if args.enable_reranker or args.enable_ragatouille_reranker:
+        config.setdefault("reranker", {})
+        config["reranker"]["enabled"] = True
+    if args.disable_reranker or args.disable_ragatouille_reranker:
+        config.setdefault("reranker", {})
+        config["reranker"]["enabled"] = False
+    if args.enable_web_reranker:
+        config.setdefault("web_validator", {})
+        config["web_validator"]["rerank_enabled"] = True
+    if args.disable_web_reranker:
+        config.setdefault("web_validator", {})
+        config["web_validator"]["rerank_enabled"] = False
     logger.info(
         "Judge config | evaluation: %s/%s | web_validator: %s/%s",
         config.get("evaluation", {}).get("judge", {}).get("provider", "ollama"),
@@ -201,6 +342,15 @@ async def main() -> None:
         config.get("web_validator", {}).get("judge", {}).get("provider", "ollama"),
         config.get("web_validator", {}).get("judge", {}).get("model", config.get("hyde", {}).get("model", "qwen2.5:14b")),
     )
+    logger.info(
+        "Retrieval config | backend=%s | reranker.enabled=%s",
+        config.get("retrieval", {}).get("backend", "hybrid"),
+        config.get("reranker", {}).get("enabled", False),
+    )
+
+    selected_models = _model_list(config, args.models)
+    selected_pipelines = _pipeline_list(config, args.pipelines)
+    await _runtime_preflight(config, selected_models, logger)
 
     train_df, test_df = load_split(config)
     split_frames: dict[str, pd.DataFrame] = {"train": train_df.copy(), "test": test_df.copy()}
@@ -220,9 +370,6 @@ async def main() -> None:
     evaluator = RAGASEvaluator(config)
     validator = ScoreValidator(config)
     few_shot_builder = FewShotBuilder(train_df, config)
-
-    selected_models = _model_list(config, args.models)
-    selected_pipelines = _pipeline_list(config, args.pipelines)
 
     all_results: dict[tuple[str, str], list[dict[str, Any]]] = {}
     progress: list[dict[str, Any]] = []

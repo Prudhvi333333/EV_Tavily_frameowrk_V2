@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from enum import Enum
 from typing import Any
 
 import httpx
 
+from src.utils.ollama import resolve_ollama_base_url
 
 class PipelineMode(str, Enum):
     RAG = "rag"
@@ -21,11 +23,19 @@ class OllamaGenerator:
         base_url: str | None = None,
         timeout: float = 120.0,
         strict: bool = True,
+        max_retries: int = 2,
+        retry_backoff_sec: float = 2.0,
+        keep_alive: str | None = None,
+        options: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+        self.base_url = resolve_ollama_base_url(base_url)
         self.timeout = timeout
         self.strict = strict
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_sec = max(0.1, float(retry_backoff_sec))
+        self.keep_alive = str(keep_alive or os.getenv("OLLAMA_KEEP_ALIVE", "0s")).strip()
+        self.options = dict(options or {})
         self._checked = False
         self._available = False
 
@@ -61,19 +71,37 @@ class OllamaGenerator:
             "prompt": prompt,
             "system": system,
             "stream": False,
-            "options": {"temperature": temperature},
+            "options": {**self.options, "temperature": temperature},
         }
-        try:
-            timeout = httpx.Timeout(connect=5.0, read=self.timeout, write=20.0, pool=5.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=payload)
-                resp.raise_for_status()
-            data = resp.json()
-            return str(data.get("response", "")).strip()
-        except Exception as e:
-            if self.strict:
-                raise RuntimeError(f"Ollama generation failed for model '{self.model}'.") from e
-            return ""
+        if self.keep_alive:
+            payload["keep_alive"] = self.keep_alive
+        last_error: Exception | None = None
+        timeout = httpx.Timeout(connect=5.0, read=self.timeout, write=20.0, pool=5.0)
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                data = resp.json()
+                return str(data.get("response", "")).strip()
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                body = ""
+                try:
+                    body = (e.response.text or "").strip()[:240] if e.response is not None else ""
+                except Exception:
+                    body = ""
+                last_error = RuntimeError(
+                    f"Ollama HTTP {status} for model '{self.model}' at {self.base_url}. Body: {body}"
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_backoff_sec * (attempt + 1))
+                    continue
+        if self.strict:
+            raise RuntimeError(f"Ollama generation failed for model '{self.model}'.") from last_error
+        return ""
 
 
 class GeminiGenerator:
@@ -180,11 +208,10 @@ def build_prompt(
 ) -> tuple[str, str]:
     reasoning_line = {
         "standard": (
-            "Use crisp factual language and avoid filler. If evidence is missing, say so explicitly."
+            "Use crisp factual language and avoid filler."
         ),
         "chain_of_thought": (
-            "Internally follow this checklist before answering: understand intent, map evidence, verify, answer. "
-            "Do not output hidden reasoning; output only final answer with evidence references."
+            "Think step-by-step internally and then provide only the final answer."
         ),
         "few_shot": (
             "Use the examples to match answer style and structure. Stay grounded and concise."
@@ -196,9 +223,8 @@ def build_prompt(
     if mode == PipelineMode.RAG:
         system = (
             "You are a data analyst for Georgia's EV supply chain.\n"
-            "Answer ONLY from provided context.\n"
-            "Never use external or pretrained knowledge.\n"
-            "If answer is not in context, return exactly: This information is not available in the knowledge base.\n"
+            "Use provided context as the main evidence source.\n"
+            "If context is incomplete, still provide the best possible answer and clearly mark uncertain parts.\n"
             f"{reasoning_line}"
         )
         user = (
@@ -215,9 +241,8 @@ def build_prompt(
             "You are an automotive supply chain expert.\n"
             "Answer from pretrained knowledge only.\n"
             "Always provide a direct, best-effort answer to the question.\n"
-            "Do not return refusal-style or uncertainty-only responses.\n"
             "For list questions, provide a structured list with company, role, and product/service.\n"
-            "If some details are uncertain, still provide the most likely information and continue.\n"
+            "If some details are uncertain, provide the most likely answer and state uncertainty briefly.\n"
             f"{reasoning_line}"
         )
         user = f"{examples_block}Question: {question}\nAnswer:"
@@ -226,10 +251,9 @@ def build_prompt(
     if mode == PipelineMode.RAG_PRETRAINED:
         system = (
             "You are an EV supply chain analyst.\n"
-            "Use context as PRIMARY source.\n"
-            "Use pretrained knowledge only when context is insufficient.\n"
-            "Tag each factual sentence: [KB] or [PRETRAINED].\n"
-            "If unknown, state uncertainty explicitly.\n"
+            "Use context as the primary source and pretrained knowledge only to fill gaps.\n"
+            "Do not fabricate facts not supported by context or clearly stated as background knowledge.\n"
+            "When useful, mention whether a claim comes from context or general knowledge in natural language.\n"
             f"{reasoning_line}"
         )
         user = (
@@ -243,10 +267,9 @@ def build_prompt(
 
     system = (
         "You are an EV research analyst with three sources.\n"
-        "Priority order: [KB] > [WEB] > [PRETRAINED].\n"
-        "Tag each factual sentence with its source tag.\n"
-        "When sources conflict, prioritize KB and mention the conflict.\n"
-        "If web context is empty, continue with [KB]/[PRETRAINED] only.\n"
+        "Prioritize sources in this order: KB context, then web context, then pretrained knowledge.\n"
+        "When sources conflict, prefer KB and mention the conflict briefly.\n"
+        "If web context is empty, continue with KB and pretrained knowledge without fabricating web claims.\n"
         f"{reasoning_line}"
     )
     user = (
@@ -269,12 +292,24 @@ class ModelGenerator:
         self.model_name = config["models"][model_key]
         self.prompt_mode = config.get("prompting", {}).get("mode", "chain_of_thought")
         self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
+        self.ollama_keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
+        self.ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
         if model_key in {"qwen", "gemma"}:
-            self.client = OllamaGenerator(self.model_name, strict=self.strict_mode)
+            self.client = OllamaGenerator(
+                self.model_name,
+                strict=self.strict_mode,
+                keep_alive=self.ollama_keep_alive,
+                options=self.ollama_options,
+            )
         elif model_key == "gemini":
             self.client = GeminiGenerator(self.model_name, strict=self.strict_mode)
         else:
-            self.client = OllamaGenerator(self.model_name, strict=self.strict_mode)
+            self.client = OllamaGenerator(
+                self.model_name,
+                strict=self.strict_mode,
+                keep_alive=self.ollama_keep_alive,
+                options=self.ollama_options,
+            )
 
     async def generate_with_mode(
         self,

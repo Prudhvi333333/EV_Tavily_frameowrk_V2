@@ -1,0 +1,206 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap");
+
+.main-shell {
+  padding: 14px 12px 28px 12px;
+  font-family: Manrope, "Segoe UI", Arial, sans-serif;
+  background:
+    radial-gradient(circle at 12% -18%, rgba(41, 173, 152, 0.26) 0, transparent 34%),
+    radial-gradient(circle at 86% -22%, rgba(45, 119, 226, 0.24) 0, transparent 36%),
+    radial-gradient(circle at 52% 120%, rgba(244, 162, 97, 0.10) 0, transparent 32%),
+    linear-gradient(180deg, #f4f9fa, #edf4fc);
+  min-height: 100vh;
+}
+
+.hero-wrap {
+  border-radius: 18px;
+  padding: 18px 20px;
+  border: 1px solid rgba(179, 222, 209, 0.78);
+  background:
+    radial-gradient(circle at 12% 18%, rgba(255, 255, 255, 0.20), transparent 35%),
+    linear-gradient(118deg, #0b7f6f, #1f6fd8 56%, #0f87bd);
+  box-shadow: 0 10px 24px rgba(18, 45, 76, 0.18);
+}
+
+.hero-title {
+  margin: 0;
+  color: #f3fffd;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.hero-subtitle {
+  margin: 4px 0 0 0;
+  color: #def4ef;
+  font-size: 0.95rem;
+}
+
+.filter-card,
+.content-card,
+.kpi-card {
+  border-radius: 14px !important;
+  border: 1px solid #d7e4e1 !important;
+  background: linear-gradient(180deg, #ffffff, #fdfefe);
+  box-shadow: 0 4px 14px rgba(19, 40, 54, 0.07);
+}
+
+.kpi-card {
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+  border-top: 3px solid #1f8a7a !important;
+}
+
+.kpi-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 20px rgba(16, 44, 62, 0.14);
+}
+
+.filter-label {
+  margin-bottom: 6px;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+  color: #5d707b;
+  font-weight: 600;
+}
+
+.kpi-label {
+  color: #5f7380;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+  font-weight: 600;
+}
+
+.kpi-value {
+  margin-top: 2px;
+  font-size: 1.35rem;
+  line-height: 1.35rem;
+  color: #183646;
+  font-weight: 700;
+}
+
+.card-title {
+  margin-bottom: 10px;
+  color: #1f3442;
+  font-weight: 700;
+}
+
+.insight-banner {
+  border-radius: 14px;
+  border: 1px solid #cfe2f3;
+  background:
+    radial-gradient(circle at 15% -20%, rgba(87, 197, 174, 0.13), transparent 45%),
+    radial-gradient(circle at 85% 120%, rgba(88, 133, 238, 0.12), transparent 42%),
+    #ffffff;
+  box-shadow: 0 6px 18px rgba(16, 44, 62, 0.08);
+  padding: 10px;
+}
+
+.insight-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.insight-chip {
+  border-radius: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  min-height: 62px;
+}
+
+.insight-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.34px;
+  font-weight: 700;
+  opacity: 0.82;
+}
+
+.insight-value {
+  margin-top: 2px;
+  font-size: 0.95rem;
+  font-weight: 700;
+  line-height: 1.15rem;
+}
+
+.insight-good {
+  background: linear-gradient(180deg, #e8faf1, #def6ea);
+  border-color: #bce8d4;
+  color: #0f6246;
+}
+
+.insight-warn {
+  background: linear-gradient(180deg, #fff8e5, #fff1d1);
+  border-color: #f2db9f;
+  color: #7a5600;
+}
+
+.insight-bad {
+  background: linear-gradient(180deg, #fff1ef, #ffe7e3);
+  border-color: #f4c6bf;
+  color: #973b32;
+}
+
+.insight-neutral {
+  background: linear-gradient(180deg, #eef4ff, #e4edfb);
+  border-color: #cadbf7;
+  color: #214476;
+}
+
+.insight-empty {
+  color: #4f6574;
+  font-weight: 600;
+  padding: 2px 4px;
+}
+
+.nav-tabs .nav-link {
+  border-radius: 10px 10px 0 0 !important;
+  border: 1px solid #d6e2eb !important;
+  margin-right: 6px !important;
+  color: #2b4454 !important;
+  font-weight: 600;
+  background: #edf4f9 !important;
+}
+
+.nav-tabs .nav-link.active {
+  color: #ffffff !important;
+  background: linear-gradient(115deg, #0e7f71, #256ad9) !important;
+  border-color: #0e7f71 !important;
+}
+
+.text-block {
+  white-space: pre-wrap;
+  border: 1px solid #dde6ed;
+  border-radius: 10px;
+  background: #f9fcff;
+  color: #1f3442;
+  font-size: 0.86rem;
+  padding: 10px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.text-inline {
+  border: 1px solid #dde6ed;
+  border-radius: 10px;
+  background: #f9fcff;
+  color: #1f3442;
+  font-size: 0.86rem;
+  padding: 8px 10px;
+}
+
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td {
+  line-height: 1.25rem;
+}
+
+@media (max-width: 1200px) {
+  .insight-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  .insight-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

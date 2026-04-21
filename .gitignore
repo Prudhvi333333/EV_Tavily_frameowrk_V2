@@ -9,6 +9,10 @@ __pycache__/
 venv/
 rag_eval_project_v2/.venv/
 
+# Environment files
+.env
+rag_eval_project_v2/.env
+
 # Test/cache
 .pytest_cache/
 .mypy_cache/
@@ -22,9 +26,11 @@ rag_eval_project_v2/.pytest_cache/
 
 # Project-generated artifacts
 blueprint_extracted.txt
+rag_eval_project_v2/webcrawler_doc_extracted.txt
 rag_eval_project_v2/outputs/
 rag_eval_project_v2/data/web_cache/
 rag_eval_project_v2/config/best_config.yaml
 rag_eval_project_v2/data/questions/train_questions.xlsx
 rag_eval_project_v2/data/questions/test_questions.xlsx
-
+rag_eval_project_v2/.hf_cache/
+rag_eval_project_v2/.hf_home/

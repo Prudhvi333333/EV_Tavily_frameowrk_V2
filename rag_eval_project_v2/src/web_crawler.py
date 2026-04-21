@@ -14,6 +14,7 @@ import numpy as np
 
 from src.generator import OllamaGenerator, OpenRouterGenerator
 from src.utils.config_loader import resolve_path
+from src.utils.embeddings import encode_for_task
 from src.utils.logger import get_logger
 
 try:
@@ -31,6 +32,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     CrossEncoder = None
 
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover - optional dependency
+    pd = None
+
 
 def _normalize_text(text: str) -> str:
     return " ".join(str(text).casefold().split())
@@ -41,6 +47,216 @@ def _domain_of_url(url: str) -> str:
     if host.startswith("www."):
         return host[4:]
     return host
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+class RegistryMetadataFilter:
+    def __init__(self, config: dict[str, Any], logger: Any, strict_mode: bool) -> None:
+        md_cfg = config.get("crawler", {}).get("metadata_filtering", {})
+        self.enabled = bool(md_cfg.get("enabled", False))
+        self.strict_mode = strict_mode
+        self.logger = logger
+        registry_raw = str(md_cfg.get("registry_path", "rag_data_management_registry.xlsx"))
+        if self.enabled:
+            if Path(registry_raw).is_absolute() or "_meta" in config:
+                self.registry_path = resolve_path(config, registry_raw)
+            else:
+                self.registry_path = Path(registry_raw).resolve()
+        else:
+            self.registry_path = Path(registry_raw)
+        self.min_metadata_score = float(md_cfg.get("min_metadata_score", 0.0))
+        self.min_credibility_score = float(md_cfg.get("min_credibility_score", 0.0))
+        self.block_rejected_domains = bool(md_cfg.get("block_rejected_domains", True))
+        self.allow_decisions = {
+            str(x).strip().casefold()
+            for x in md_cfg.get("allow_decisions", ["keep", "selected", "approved", "accept"])
+            if str(x).strip()
+        }
+        self.block_decisions = {
+            str(x).strip().casefold()
+            for x in md_cfg.get("block_decisions", ["discard", "rejected", "reject", "drop", "blocked"])
+            if str(x).strip()
+        }
+        self._loaded = False
+        self.allowed_domains: set[str] = set()
+        self.blocked_domains: dict[str, str] = {}
+        self.domain_scores: dict[str, dict[str, float | None]] = {}
+
+    def _domain_from_row(self, row: dict[str, Any]) -> str:
+        domain_keys = [
+            "Source_Domain",
+            "source_domain",
+            "Domain",
+            "domain",
+        ]
+        for key in domain_keys:
+            value = str(row.get(key, "")).strip()
+            if value:
+                cleaned = value.casefold()
+                return cleaned[4:] if cleaned.startswith("www.") else cleaned
+
+        url_keys = ["Document_URL", "Source_URL", "url", "URL"]
+        for key in url_keys:
+            value = str(row.get(key, "")).strip()
+            if value:
+                return _domain_of_url(value)
+        return ""
+
+    def _rows(self, path: str, sheet_name: str) -> list[dict[str, Any]]:
+        if pd is None:
+            raise RuntimeError("pandas is required for metadata registry filtering.")
+        try:
+            frame = pd.read_excel(path, sheet_name=sheet_name)
+        except ValueError:
+            return []
+        if frame.empty:
+            return []
+        return frame.to_dict(orient="records")
+
+    def _load(self) -> None:
+        if self._loaded or not self.enabled:
+            return
+        self._loaded = True
+
+        if not self.registry_path.exists():
+            raise RuntimeError(
+                f"Metadata registry file is missing: {self.registry_path}"
+            )
+
+        registry = str(self.registry_path)
+        review_rows = self._rows(registry, "Review_Ready")
+        rejected_rows = self._rows(registry, "Rejected_Documents")
+        failed_rows = self._rows(registry, "Failed_Acquisitions")
+
+        for row in review_rows:
+            domain = self._domain_from_row(row)
+            if not domain:
+                continue
+            decision = str(row.get("Final_Decision", "")).strip().casefold()
+            metadata_score = _float_or_none(row.get("Metadata_Score"))
+            credibility_score = _float_or_none(row.get("Credibility_Score"))
+
+            if domain not in self.domain_scores:
+                self.domain_scores[domain] = {"metadata": metadata_score, "credibility": credibility_score}
+            else:
+                current = self.domain_scores[domain]
+                if metadata_score is not None:
+                    prev = current.get("metadata")
+                    current["metadata"] = metadata_score if prev is None else max(float(prev), metadata_score)
+                if credibility_score is not None:
+                    prev = current.get("credibility")
+                    current["credibility"] = credibility_score if prev is None else max(float(prev), credibility_score)
+
+            if decision in self.allow_decisions:
+                self.allowed_domains.add(domain)
+            elif decision in self.block_decisions and self.block_rejected_domains:
+                self.blocked_domains.setdefault(domain, "registry_review_blocked")
+
+        if self.block_rejected_domains:
+            for row in rejected_rows:
+                domain = self._domain_from_row(row)
+                if not domain:
+                    continue
+                category = str(row.get("Rejection_Category", "")).strip().casefold() or "registry_rejected_document"
+                self.blocked_domains.setdefault(domain, category)
+
+            for row in failed_rows:
+                domain = self._domain_from_row(row)
+                if not domain:
+                    continue
+                status = str(row.get("Acquisition_Status", "")).strip().casefold()
+                if any(flag in status for flag in ["failed", "blocked", "forbidden"]):
+                    self.blocked_domains.setdefault(domain, "registry_failed_acquisition")
+
+        self.logger.info(
+            "Metadata registry loaded | path=%s | allow_domains=%s | block_domains=%s",
+            self.registry_path,
+            len(self.allowed_domains),
+            len(self.blocked_domains),
+        )
+
+    def filter_search_results(self, results: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        if not self.enabled:
+            return results, []
+
+        self._load()
+
+        accepted: list[dict[str, str]] = []
+        rejected: list[dict[str, Any]] = []
+
+        for item in results:
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            domain = _domain_of_url(url)
+            if not domain:
+                accepted.append(item)
+                continue
+
+            if domain in self.allowed_domains:
+                accepted.append(item)
+                continue
+
+            if domain in self.blocked_domains:
+                rejected.append(
+                    {
+                        "url": url,
+                        "source_domain": domain,
+                        "reason": f"registry_domain_block:{self.blocked_domains[domain]}",
+                        "metadata_score": None,
+                        "credibility_score": None,
+                    }
+                )
+                continue
+
+            scores = self.domain_scores.get(domain, {})
+            metadata_score = _float_or_none(scores.get("metadata"))
+            credibility_score = _float_or_none(scores.get("credibility"))
+
+            if metadata_score is not None and metadata_score < self.min_metadata_score:
+                rejected.append(
+                    {
+                        "url": url,
+                        "source_domain": domain,
+                        "reason": f"registry_metadata_score_below_threshold:{metadata_score:.2f}",
+                        "metadata_score": metadata_score,
+                        "credibility_score": credibility_score,
+                    }
+                )
+                continue
+
+            if credibility_score is not None and credibility_score < self.min_credibility_score:
+                rejected.append(
+                    {
+                        "url": url,
+                        "source_domain": domain,
+                        "reason": f"registry_credibility_score_below_threshold:{credibility_score:.2f}",
+                        "metadata_score": metadata_score,
+                        "credibility_score": credibility_score,
+                    }
+                )
+                continue
+
+            accepted.append(item)
+
+        self.logger.info(
+            "Metadata filter applied | candidates=%s | accepted=%s | rejected=%s",
+            len(results),
+            len(accepted),
+            len(rejected),
+        )
+        return accepted, rejected
 
 
 def _prepare_keywords(items: list[Any]) -> list[str]:
@@ -98,7 +314,15 @@ def parse_judge_response(response: str, strict_mode: bool = True) -> tuple[float
         cleaned = "\n".join(lines).strip()
 
     try:
-        parsed = json.loads(cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            # Some judge models may prepend short text before JSON.
+            start = cleaned.find("{")
+            if start < 0:
+                raise
+            decoder = json.JSONDecoder()
+            parsed, _ = decoder.raw_decode(cleaned[start:])
         score_raw = float(parsed.get("score", 0))
         partial_raw = parsed.get("partial_relevance", None)
         reason = str(parsed.get("reason", "")).strip() or "no_reason"
@@ -132,7 +356,13 @@ class KBCentroidValidator:
         self.centroid = centroid / norm
 
     def score(self, text: str) -> float:
-        vec = self.embedding_model.encode([text], normalize_embeddings=True, convert_to_numpy=True)[0]
+        vec = encode_for_task(
+            self.embedding_model,
+            [text],
+            task="document",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )[0]
         vec = np.asarray(vec, dtype=float)
         vec_norm = float(np.linalg.norm(vec))
         if vec_norm == 0:
@@ -327,6 +557,12 @@ class WebCrawler:
         crawler_cfg = config.get("crawler", {})
         self.timeout_per_url = float(crawler_cfg.get("timeout_per_url", 20))
         self.total_timeout = float(crawler_cfg.get("total_timeout", 60))
+        self.tavily_timeout = float(crawler_cfg.get("tavily_timeout", 75))
+        self.tavily_max_retries = max(int(crawler_cfg.get("tavily_max_retries", 3)), 1)
+        self.tavily_retry_backoff_sec = max(float(crawler_cfg.get("tavily_retry_backoff_sec", 2.0)), 0.1)
+        self.firecrawl_max_retries = max(int(crawler_cfg.get("firecrawl_max_retries", 2)), 1)
+        self.firecrawl_retry_backoff_sec = max(float(crawler_cfg.get("firecrawl_retry_backoff_sec", 1.5)), 0.1)
+        self.fail_on_search_error = bool(crawler_cfg.get("fail_on_search_error", False))
         self.max_urls = int(crawler_cfg.get("max_urls", 5))
         self.top_results = int(crawler_cfg.get("top_results", 2))
         self.cache_enabled = bool(crawler_cfg.get("cache_enabled", True))
@@ -339,8 +575,16 @@ class WebCrawler:
         self.firecrawl_api_key = os.getenv(self.firecrawl_key_env, "").strip()
 
         qwen_model = config.get("hyde", {}).get("model", "qwen2.5:14b")
-        self.local_qwen = OllamaGenerator(qwen_model, strict=self.strict_mode)
+        keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
+        ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
+        self.local_qwen = OllamaGenerator(
+            qwen_model,
+            strict=self.strict_mode,
+            keep_alive=keep_alive,
+            options=ollama_options,
+        )
         web_judge_cfg = config.get("web_validator", {}).get("judge", {})
+        self.web_rerank_enabled = bool(config.get("web_validator", {}).get("rerank_enabled", True))
         web_judge_provider = str(web_judge_cfg.get("provider", "ollama")).lower()
         web_judge_model = str(web_judge_cfg.get("model", qwen_model))
         if web_judge_provider in {"openrouter", "kimi_cloud", "kimi"}:
@@ -351,13 +595,22 @@ class WebCrawler:
                 strict=self.strict_mode,
             )
         else:
-            self.web_relevance_judge = OllamaGenerator(web_judge_model, strict=self.strict_mode)
+            self.web_relevance_judge = OllamaGenerator(
+                web_judge_model,
+                strict=self.strict_mode,
+                keep_alive=keep_alive,
+                options=ollama_options,
+            )
         self.centroid_validator = KBCentroidValidator(kb_collection, embedding_model)
         self.validator = DocumentValidator(config, self.centroid_validator, self.web_relevance_judge, self.logger)
         self.proof_logger = ProofLogger(config, self.logger)
+        self.registry_filter = RegistryMetadataFilter(config, self.logger, strict_mode=self.strict_mode)
 
         self.cross_encoder_model = config.get("embeddings", {}).get(
-            "cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            "cross_encoder_model", "cross-encoder/ms-marco-MiniLM-L6-v2"
+        )
+        self.cross_encoder_local_files_only = bool(
+            config.get("web_validator", {}).get("cross_encoder_local_files_only", False)
         )
         self._cross_encoder = None
         self._tavily_client = TavilyClient(api_key=self.tavily_api_key) if TavilyClient and self.tavily_api_key else None
@@ -407,9 +660,66 @@ class WebCrawler:
             async with asyncio.timeout(self.total_timeout):
                 search_query = await self.generate_search_query(question)
                 result_payload["search_query"] = search_query
-                search_results = await self._search_tavily(search_query)
+                try:
+                    search_results = await self._search_tavily(search_query)
+                except Exception as exc:
+                    self.logger.warning("Tavily search failed for question '%s': %s", question[:100], exc)
+                    result_payload["search_error"] = f"{type(exc).__name__}:{exc}"
+                    if self.cache_enabled:
+                        with cache_path.open("w", encoding="utf-8") as f:
+                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+                    return result_payload
                 if not search_results:
                     self.logger.warning("No Tavily search results for question: %s", question[:100])
+                    return result_payload
+
+                try:
+                    filtered_results, registry_rejections = self.registry_filter.filter_search_results(search_results)
+                except Exception as exc:
+                    raise RuntimeError("Metadata registry filtering failed.") from exc
+
+                for reject in registry_rejections:
+                    reason = str(reject.get("reason", "registry_rejected"))
+                    source_domain = str(reject.get("source_domain", ""))
+                    url = str(reject.get("url", ""))
+                    metadata_score = reject.get("metadata_score")
+                    credibility_score = reject.get("credibility_score")
+                    score_hint = []
+                    if metadata_score is not None:
+                        score_hint.append(f"metadata={float(metadata_score):.2f}")
+                    if credibility_score is not None:
+                        score_hint.append(f"credibility={float(credibility_score):.2f}")
+                    detail = f"{reason}" if not score_hint else f"{reason} ({', '.join(score_hint)})"
+                    vr = ValidationResult(
+                        accepted=False,
+                        low_confidence=False,
+                        final_score=0.0,
+                        s1_keyword=0.0,
+                        s2_semantic=0.0,
+                        s3_llm=0.0,
+                        s3_partial_relevance=0.0,
+                        s3_reason=detail,
+                        url=url,
+                        source_domain=source_domain,
+                        decision=f"REJECTED_REGISTRY: {detail}",
+                        text_preview="",
+                    )
+                    self.proof_logger.log(
+                        question=question,
+                        search_query=search_query,
+                        result=vr,
+                        question_id=question_id,
+                        pipeline=pipeline,
+                    )
+                    validation_records.append(self._validation_record(vr))
+
+                search_results = filtered_results
+                result_payload["records"] = list(validation_records)
+                if not search_results:
+                    self.logger.warning("All Tavily candidates rejected by metadata policy for question: %s", question[:100])
+                    if self.cache_enabled:
+                        with cache_path.open("w", encoding="utf-8") as f:
+                            json.dump(result_payload, f, ensure_ascii=False, indent=2)
                     return result_payload
 
                 for item in search_results:
@@ -420,10 +730,7 @@ class WebCrawler:
                     raw_text = ""
                     extracted = ""
                     try:
-                        raw_text = await asyncio.wait_for(
-                            self._scrape_with_firecrawl(url),
-                            timeout=self.timeout_per_url,
-                        )
+                        raw_text = await self._scrape_with_firecrawl_with_retry(url)
                     except TimeoutError:
                         self.logger.warning("Firecrawl timeout for URL: %s", url)
                         vr = ValidationResult(
@@ -565,6 +872,7 @@ class WebCrawler:
                 query=query,
                 max_results=self.max_urls,
                 search_depth="advanced",
+                timeout=self.tavily_timeout,
             )
             out: list[dict[str, str]] = []
             for item in response.get("results", []):
@@ -580,13 +888,34 @@ class WebCrawler:
                 )
             return out
 
-        try:
-            return await asyncio.to_thread(_run)
-        except Exception as exc:
-            if self.strict_mode:
-                raise RuntimeError("Tavily search failed.") from exc
-            self.logger.warning("Tavily search failed: %s", exc)
-            return []
+        last_exc: Exception | None = None
+        for attempt in range(1, self.tavily_max_retries + 1):
+            try:
+                return await asyncio.to_thread(_run)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self.tavily_max_retries:
+                    wait_s = self.tavily_retry_backoff_sec * attempt
+                    self.logger.warning(
+                        "Tavily search attempt %s/%s failed for query '%s': %s. Retrying in %.1fs",
+                        attempt,
+                        self.tavily_max_retries,
+                        query[:90],
+                        exc,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+
+        self.logger.warning(
+            "Tavily search failed after %s attempts for query '%s': %s",
+            self.tavily_max_retries,
+            query[:90],
+            last_exc,
+        )
+        if self.fail_on_search_error:
+            raise RuntimeError("Tavily search failed.") from last_exc
+        return []
 
     async def _scrape_with_firecrawl(self, url: str) -> str:
         if self._firecrawl_app is None:
@@ -631,13 +960,62 @@ class WebCrawler:
             self.logger.warning("Firecrawl scrape failed for %s: %s", url, exc)
             return ""
 
+    async def _scrape_with_firecrawl_with_retry(self, url: str) -> str:
+        last_exc: Exception | None = None
+        for attempt in range(1, self.firecrawl_max_retries + 1):
+            try:
+                return await asyncio.wait_for(
+                    self._scrape_with_firecrawl(url),
+                    timeout=self.timeout_per_url,
+                )
+            except TimeoutError as exc:
+                last_exc = exc
+                if attempt < self.firecrawl_max_retries:
+                    wait_s = self.firecrawl_retry_backoff_sec * attempt
+                    self.logger.warning(
+                        "Firecrawl timeout attempt %s/%s for URL: %s. Retrying in %.1fs",
+                        attempt,
+                        self.firecrawl_max_retries,
+                        url,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self.firecrawl_max_retries:
+                    wait_s = self.firecrawl_retry_backoff_sec * attempt
+                    self.logger.warning(
+                        "Firecrawl error attempt %s/%s for URL: %s | %s. Retrying in %.1fs",
+                        attempt,
+                        self.firecrawl_max_retries,
+                        url,
+                        exc,
+                        wait_s,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return ""
+
     async def _rerank(self, question: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not docs:
             return []
+        if not self.web_rerank_enabled:
+            out = sorted(docs, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+            for row in out:
+                row["rerank_score"] = None
+            return out
         if CrossEncoder is None:
             raise RuntimeError("CrossEncoder is required for web reranking but is not installed.")
         if self._cross_encoder is None:
-            self._cross_encoder = CrossEncoder(self.cross_encoder_model, local_files_only=True)
+            self._cross_encoder = CrossEncoder(
+                self.cross_encoder_model,
+                local_files_only=self.cross_encoder_local_files_only,
+            )
         pairs = [[question, str(d.get("text", ""))] for d in docs]
         scores = self._cross_encoder.predict(pairs)
         zipped = list(zip(docs, scores))
