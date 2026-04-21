@@ -118,20 +118,12 @@ crawler:
   metadata_filtering:
     enabled: true
     registry_path: rag_data_management_registry.xlsx
-    block_rejected_domains: true
-    min_metadata_score: 35.0
-    min_credibility_score: 35.0
-    allow_decisions:
-      - keep
-      - selected
-      - approved
-      - accept
-    block_decisions:
-      - discard
-      - rejected
-      - reject
-      - drop
-      - blocked
+    validate_registry_schema: true
+    min_tavily_metadata_score: 0.14
+    min_query_overlap: 0.04
+    max_results_per_domain: 2
+    allowed_domains: []
+    blocked_domains: []
 
 web_validator:
   rerank_enabled: true

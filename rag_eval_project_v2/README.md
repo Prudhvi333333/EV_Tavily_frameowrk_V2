@@ -312,19 +312,22 @@ Web proof log (append-only JSONL):
 
 ## Tavily metadata policy filter
 
-Registry-driven Tavily candidate filtering is enabled in `config/config.yaml` under:
+Tavily metadata policy filtering is enabled in `config/config.yaml` under:
 
 - `crawler.metadata_filtering.enabled`
 - `crawler.metadata_filtering.registry_path`
-- `crawler.metadata_filtering.min_metadata_score`
-- `crawler.metadata_filtering.min_credibility_score`
-- `crawler.metadata_filtering.allow_decisions`
-- `crawler.metadata_filtering.block_decisions`
+- `crawler.metadata_filtering.validate_registry_schema`
+- `crawler.metadata_filtering.min_tavily_metadata_score`
+- `crawler.metadata_filtering.min_query_overlap`
+- `crawler.metadata_filtering.max_results_per_domain`
+- `crawler.metadata_filtering.allowed_domains`
+- `crawler.metadata_filtering.blocked_domains`
 
 Behavior:
 
-- Filters Tavily URLs before Firecrawl scrape using `rag_data_management_registry.xlsx`
-- Applies domain blocklist/allowlist and score thresholds
+- Filters Tavily URLs before Firecrawl scrape using live Tavily metadata (`title`, `content`, `url`) + policy thresholds
+- Treats `rag_data_management_registry.xlsx` as a schema/reference template only (not a source of filtering decisions)
+- Applies configured domain blocklist/allowlist and score thresholds
 - Logs policy rejections into web validation proof flow
 
 ## How Train/Test Split Works

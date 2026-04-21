@@ -67,6 +67,7 @@ class RegistryMetadataFilter:
         self.enabled = bool(md_cfg.get("enabled", False))
         self.strict_mode = strict_mode
         self.logger = logger
+        self.keyword_config = dict(config.get("web_validator", {}).get("domain_keywords", {}))
         registry_raw = str(md_cfg.get("registry_path", "rag_data_management_registry.xlsx"))
         if self.enabled:
             if Path(registry_raw).is_absolute() or "_meta" in config:
@@ -75,124 +76,79 @@ class RegistryMetadataFilter:
                 self.registry_path = Path(registry_raw).resolve()
         else:
             self.registry_path = Path(registry_raw)
-        self.min_metadata_score = float(md_cfg.get("min_metadata_score", 0.0))
-        self.min_credibility_score = float(md_cfg.get("min_credibility_score", 0.0))
-        self.block_rejected_domains = bool(md_cfg.get("block_rejected_domains", True))
-        self.allow_decisions = {
-            str(x).strip().casefold()
-            for x in md_cfg.get("allow_decisions", ["keep", "selected", "approved", "accept"])
+        self.validate_registry_schema = bool(md_cfg.get("validate_registry_schema", True))
+        self.min_policy_score = float(md_cfg.get("min_tavily_metadata_score", md_cfg.get("min_metadata_score", 0.0)))
+        self.min_query_overlap = float(md_cfg.get("min_query_overlap", 0.0))
+        self.max_results_per_domain = max(int(md_cfg.get("max_results_per_domain", 0)), 0)
+        self.allowed_domains = {
+            str(x).strip().casefold().removeprefix("www.")
+            for x in md_cfg.get("allowed_domains", [])
             if str(x).strip()
         }
-        self.block_decisions = {
-            str(x).strip().casefold()
-            for x in md_cfg.get("block_decisions", ["discard", "rejected", "reject", "drop", "blocked"])
+        self.blocked_domains = {
+            str(x).strip().casefold().removeprefix("www.")
+            for x in md_cfg.get("blocked_domains", [])
             if str(x).strip()
         }
         self._loaded = False
-        self.allowed_domains: set[str] = set()
-        self.blocked_domains: dict[str, str] = {}
-        self.domain_scores: dict[str, dict[str, float | None]] = {}
-
-    def _domain_from_row(self, row: dict[str, Any]) -> str:
-        domain_keys = [
-            "Source_Domain",
-            "source_domain",
-            "Domain",
-            "domain",
-        ]
-        for key in domain_keys:
-            value = str(row.get(key, "")).strip()
-            if value:
-                cleaned = value.casefold()
-                return cleaned[4:] if cleaned.startswith("www.") else cleaned
-
-        url_keys = ["Document_URL", "Source_URL", "url", "URL"]
-        for key in url_keys:
-            value = str(row.get(key, "")).strip()
-            if value:
-                return _domain_of_url(value)
-        return ""
-
-    def _rows(self, path: str, sheet_name: str) -> list[dict[str, Any]]:
-        if pd is None:
-            raise RuntimeError("pandas is required for metadata registry filtering.")
-        try:
-            frame = pd.read_excel(path, sheet_name=sheet_name)
-        except ValueError:
-            return []
-        if frame.empty:
-            return []
-        return frame.to_dict(orient="records")
 
     def _load(self) -> None:
         if self._loaded or not self.enabled:
             return
         self._loaded = True
-
+        if not self.validate_registry_schema:
+            return
         if not self.registry_path.exists():
-            raise RuntimeError(
-                f"Metadata registry file is missing: {self.registry_path}"
+            self.logger.warning(
+                "Metadata registry reference file not found (schema-only, non-blocking): %s",
+                self.registry_path,
             )
+            return
+        if pd is None:
+            self.logger.warning("pandas is unavailable; registry schema validation skipped.")
+            return
+        try:
+            workbook = pd.ExcelFile(str(self.registry_path))
+        except Exception as exc:
+            self.logger.warning("Failed to open registry schema reference '%s': %s", self.registry_path, exc)
+            return
+        required_sheets = {"Review_Ready", "Rejected_Documents", "Failed_Acquisitions"}
+        missing = sorted(required_sheets - set(workbook.sheet_names))
+        if missing:
+            self.logger.warning("Registry schema reference missing expected sheets: %s", missing)
+        else:
+            self.logger.info("Registry schema reference validated: %s", self.registry_path)
 
-        registry = str(self.registry_path)
-        review_rows = self._rows(registry, "Review_Ready")
-        rejected_rows = self._rows(registry, "Rejected_Documents")
-        failed_rows = self._rows(registry, "Failed_Acquisitions")
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        normalized = "".join(ch if ch.isalnum() else " " for ch in text.casefold())
+        return {tok for tok in normalized.split() if tok}
 
-        for row in review_rows:
-            domain = self._domain_from_row(row)
-            if not domain:
-                continue
-            decision = str(row.get("Final_Decision", "")).strip().casefold()
-            metadata_score = _float_or_none(row.get("Metadata_Score"))
-            credibility_score = _float_or_none(row.get("Credibility_Score"))
+    def _query_overlap(self, query_text: str, text: str) -> float:
+        q = self._tokenize(query_text)
+        t = self._tokenize(text)
+        if not q or not t:
+            return 0.0
+        return round(len(q & t) / max(len(q), 1), 4)
 
-            if domain not in self.domain_scores:
-                self.domain_scores[domain] = {"metadata": metadata_score, "credibility": credibility_score}
-            else:
-                current = self.domain_scores[domain]
-                if metadata_score is not None:
-                    prev = current.get("metadata")
-                    current["metadata"] = metadata_score if prev is None else max(float(prev), metadata_score)
-                if credibility_score is not None:
-                    prev = current.get("credibility")
-                    current["credibility"] = credibility_score if prev is None else max(float(prev), credibility_score)
+    def _policy_score(self, query_text: str, title: str, content: str) -> tuple[float, float]:
+        combined = f"{title}\n{content}".strip()
+        keyword_score = score_domain_keywords(combined, self.keyword_config)
+        overlap = self._query_overlap(query_text, combined)
+        score = round((0.60 * keyword_score) + (0.40 * overlap), 4)
+        return score, overlap
 
-            if decision in self.allow_decisions:
-                self.allowed_domains.add(domain)
-            elif decision in self.block_decisions and self.block_rejected_domains:
-                self.blocked_domains.setdefault(domain, "registry_review_blocked")
-
-        if self.block_rejected_domains:
-            for row in rejected_rows:
-                domain = self._domain_from_row(row)
-                if not domain:
-                    continue
-                category = str(row.get("Rejection_Category", "")).strip().casefold() or "registry_rejected_document"
-                self.blocked_domains.setdefault(domain, category)
-
-            for row in failed_rows:
-                domain = self._domain_from_row(row)
-                if not domain:
-                    continue
-                status = str(row.get("Acquisition_Status", "")).strip().casefold()
-                if any(flag in status for flag in ["failed", "blocked", "forbidden"]):
-                    self.blocked_domains.setdefault(domain, "registry_failed_acquisition")
-
-        self.logger.info(
-            "Metadata registry loaded | path=%s | allow_domains=%s | block_domains=%s",
-            self.registry_path,
-            len(self.allowed_domains),
-            len(self.blocked_domains),
-        )
-
-    def filter_search_results(self, results: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    def filter_search_results(
+        self,
+        results: list[dict[str, str]],
+        query_text: str,
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         if not self.enabled:
             return results, []
 
         self._load()
 
-        accepted: list[dict[str, str]] = []
+        accepted_scored: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
 
         for item in results:
@@ -200,55 +156,90 @@ class RegistryMetadataFilter:
             if not url:
                 continue
             domain = _domain_of_url(url)
-            if not domain:
-                accepted.append(item)
-                continue
-
-            if domain in self.allowed_domains:
-                accepted.append(item)
-                continue
-
+            title = str(item.get("title", "")).strip()
+            content = str(item.get("content", "")).strip()
+            policy_score, query_overlap = self._policy_score(query_text=query_text, title=title, content=content)
             if domain in self.blocked_domains:
                 rejected.append(
                     {
                         "url": url,
                         "source_domain": domain,
-                        "reason": f"registry_domain_block:{self.blocked_domains[domain]}",
-                        "metadata_score": None,
+                        "reason": "policy_blocked_domain",
+                        "metadata_score": policy_score,
                         "credibility_score": None,
                     }
                 )
                 continue
 
-            scores = self.domain_scores.get(domain, {})
-            metadata_score = _float_or_none(scores.get("metadata"))
-            credibility_score = _float_or_none(scores.get("credibility"))
+            if domain not in self.allowed_domains:
+                if policy_score < self.min_policy_score:
+                    rejected.append(
+                        {
+                            "url": url,
+                            "source_domain": domain,
+                            "reason": f"policy_score_below_threshold:{policy_score:.3f}",
+                            "metadata_score": policy_score,
+                            "credibility_score": None,
+                        }
+                    )
+                    continue
+                if query_overlap < self.min_query_overlap:
+                    rejected.append(
+                        {
+                            "url": url,
+                            "source_domain": domain,
+                            "reason": f"policy_query_overlap_below_threshold:{query_overlap:.3f}",
+                            "metadata_score": policy_score,
+                            "credibility_score": None,
+                        }
+                    )
+                    continue
 
-            if metadata_score is not None and metadata_score < self.min_metadata_score:
-                rejected.append(
+            accepted_scored.append(
+                {
+                    "url": url,
+                    "source_domain": domain,
+                    "title": title,
+                    "content": content,
+                    "metadata_score": policy_score,
+                    "query_overlap": query_overlap,
+                }
+            )
+
+        accepted: list[dict[str, str]] = []
+        if self.max_results_per_domain > 0 and accepted_scored:
+            by_domain: dict[str, list[dict[str, Any]]] = {}
+            for row in accepted_scored:
+                by_domain.setdefault(str(row.get("source_domain", "")), []).append(row)
+            for domain_rows in by_domain.values():
+                domain_rows.sort(key=lambda x: float(x.get("metadata_score", 0.0)), reverse=True)
+                accepted.extend(
                     {
-                        "url": url,
-                        "source_domain": domain,
-                        "reason": f"registry_metadata_score_below_threshold:{metadata_score:.2f}",
-                        "metadata_score": metadata_score,
-                        "credibility_score": credibility_score,
+                        "url": str(row.get("url", "")),
+                        "title": str(row.get("title", "")),
+                        "content": str(row.get("content", "")),
                     }
+                    for row in domain_rows[: self.max_results_per_domain]
                 )
-                continue
-
-            if credibility_score is not None and credibility_score < self.min_credibility_score:
-                rejected.append(
-                    {
-                        "url": url,
-                        "source_domain": domain,
-                        "reason": f"registry_credibility_score_below_threshold:{credibility_score:.2f}",
-                        "metadata_score": metadata_score,
-                        "credibility_score": credibility_score,
-                    }
-                )
-                continue
-
-            accepted.append(item)
+                for row in domain_rows[self.max_results_per_domain :]:
+                    rejected.append(
+                        {
+                            "url": str(row.get("url", "")),
+                            "source_domain": str(row.get("source_domain", "")),
+                            "reason": "policy_domain_cap_exceeded",
+                            "metadata_score": row.get("metadata_score"),
+                            "credibility_score": None,
+                        }
+                    )
+        else:
+            accepted = [
+                {
+                    "url": str(row.get("url", "")),
+                    "title": str(row.get("title", "")),
+                    "content": str(row.get("content", "")),
+                }
+                for row in accepted_scored
+            ]
 
         self.logger.info(
             "Metadata filter applied | candidates=%s | accepted=%s | rejected=%s",
@@ -674,12 +665,15 @@ class WebCrawler:
                     return result_payload
 
                 try:
-                    filtered_results, registry_rejections = self.registry_filter.filter_search_results(search_results)
+                    filtered_results, registry_rejections = self.registry_filter.filter_search_results(
+                        search_results,
+                        query_text=search_query,
+                    )
                 except Exception as exc:
                     raise RuntimeError("Metadata registry filtering failed.") from exc
 
                 for reject in registry_rejections:
-                    reason = str(reject.get("reason", "registry_rejected"))
+                    reason = str(reject.get("reason", "metadata_policy_rejected"))
                     source_domain = str(reject.get("source_domain", ""))
                     url = str(reject.get("url", ""))
                     metadata_score = reject.get("metadata_score")
@@ -701,7 +695,7 @@ class WebCrawler:
                         s3_reason=detail,
                         url=url,
                         source_domain=source_domain,
-                        decision=f"REJECTED_REGISTRY: {detail}",
+                        decision=f"REJECTED_METADATA_POLICY: {detail}",
                         text_preview="",
                     )
                     self.proof_logger.log(

@@ -293,17 +293,17 @@
             <span class="pill ok">Now Implemented</span>
             <ul>
               <li>Pre-scrape policy filter on Tavily candidates</li>
-              <li>Registry-driven domain blocklist from <code>Rejected_Documents</code> / <code>Failed_Acquisitions</code></li>
-              <li>Allowlist override from <code>Review_Ready.Final_Decision</code></li>
-              <li>Score thresholds: metadata and credibility</li>
+              <li>Live candidate scoring from Tavily title/content + query overlap</li>
+              <li>Config-driven allow/block domains and thresholds</li>
+              <li>Per-domain cap to avoid single-domain dominance</li>
               <li>Policy rejections are logged in proof records</li>
             </ul>
           </div>
           <div>
             <span class="pill warn">Data Dependency</span>
             <ul>
-              <li>Registry file: <code>rag_data_management_registry.xlsx</code></li>
-              <li>If policy is enabled and registry is missing, run fails fast</li>
+              <li>Registry file is schema reference only: <code>rag_data_management_registry.xlsx</code></li>
+              <li>Missing registry does not block crawling; only schema validation is skipped</li>
               <li>Config: <code>crawler.metadata_filtering.*</code></li>
             </ul>
           </div>
@@ -345,7 +345,7 @@
           <tr>
             <td><code>rag_pretrained_web</code></td>
             <td>Yes</td>
-            <td>Yes (Tavily → registry filter → Firecrawl → validation → web rerank)</td>
+            <td>Yes (Tavily -> metadata policy -> Firecrawl -> validation -> web rerank)</td>
             <td>High-coverage pipeline with external evidence</td>
           </tr>
         </tbody>
@@ -354,4 +354,3 @@
   </div>
 </body>
 </html>
-
