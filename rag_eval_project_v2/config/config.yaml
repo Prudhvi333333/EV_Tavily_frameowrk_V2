@@ -1,8 +1,12 @@
 runtime:
   strict_mode: true
   ollama_keep_alive: 0s
-  ollama_options:
-    num_ctx: 4096
+  ollama_options: {}
+  generation:
+    timeout_sec: 600        # 31B-class models can need >120s on long prompts
+    max_retries: 3
+    retry_backoff_sec: 5.0
+    on_error: skip          # 'skip' = log + continue with empty answer; 'fail' = raise
 
 project:
   name: rag_eval_project_v2
@@ -29,7 +33,7 @@ pipelines:
 models:
   qwen: qwen2.5:14b
   kimi: kimi-k2.5:cloud
-  gemma: gemma3:12b
+  gemma: gemma4:31b-chat
   gemini: gemini-2.5-flash-preview-05-20
 
 run:
@@ -80,8 +84,6 @@ retrieval:
     oem_match_boost: 0.05
     max_boost: 0.30
     max_penalty: -0.22
-  chunk_strategy: row_only
-  prompt_variant: chain_of_thought
 
 reranker:
   enabled: true
@@ -113,7 +115,6 @@ crawler:
   max_web_context_chars: 3200
   cache_enabled: true
   search_provider: tavily
-  crawl_provider: firecrawl
   tavily_api_key_env: TAVILY_API_KEY
   firecrawl_api_key_env: FIRECRAWL_API_KEY
   tavily_answer_fallback:
@@ -144,8 +145,9 @@ web_validator:
   judge:
     provider: ollama
     model: kimi-k2.5:cloud
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
   signal_weights:
     - 0.40
     - 0.35
@@ -190,14 +192,15 @@ evaluation:
   judge:
     provider: ollama
     model: kimi-k2.5:cloud
-    ollama_base_url: http://localhost:11434
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
   validator:
     provider: ollama
     model: kimi-k2.5:cloud
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
     flag_threshold: 0.3
   weights_rag:
     faithfulness: 0.25

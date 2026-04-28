@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import numpy as np
@@ -51,16 +50,6 @@ class FewShotBuilder:
             blocks.append(f"Example {counter}:\nQuestion: {q}\nAnswer: {a}")
             counter += 1
         return "\n\n".join(blocks)
-
-    def format_for_list_question(self, example: dict[str, str]) -> str:
-        answer = str(example.get("answer", ""))
-        first_num = re.search(r"\b(\d+)\b", answer)
-        if first_num:
-            return f"There are {first_num.group(1)} companies: [formatted list follows]."
-        return "There are N companies: [formatted list follows]."
-
-    def _format_rag_template(self, golden_answer: str) -> str:
-        return self._prepare_example_answer(golden_answer, pipeline_mode="rag")
 
     def _prepare_example_answer(self, golden_answer: str, pipeline_mode: str) -> str:
         raw = str(golden_answer or "").strip()

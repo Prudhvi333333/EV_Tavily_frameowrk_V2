@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from src.generator import OllamaGenerator, OpenRouterGenerator
+from src.generator import OllamaGenerator, OpenRouterGenerator, load_generation_config
 from src.utils.config_loader import resolve_path
 from src.utils.embeddings import encode_for_task
 from src.utils.logger import get_logger
@@ -47,18 +47,6 @@ def _domain_of_url(url: str) -> str:
     if host.startswith("www."):
         return host[4:]
     return host
-
-
-def _float_or_none(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return float(text)
-    except Exception:
-        return None
 
 
 class RegistryMetadataFilter:
@@ -574,9 +562,13 @@ class WebCrawler:
         qwen_model = config.get("hyde", {}).get("model", "qwen2.5:14b")
         keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
         ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
+        gen_cfg = load_generation_config(config)
         self.local_qwen = OllamaGenerator(
             qwen_model,
             strict=self.strict_mode,
+            timeout=gen_cfg["timeout"],
+            max_retries=gen_cfg["max_retries"],
+            retry_backoff_sec=gen_cfg["retry_backoff_sec"],
             keep_alive=keep_alive,
             options=ollama_options,
         )
@@ -589,12 +581,18 @@ class WebCrawler:
                 web_judge_model,
                 api_key_env=str(web_judge_cfg.get("api_key_env", "OPENROUTER_API_KEY")),
                 base_url=str(web_judge_cfg.get("base_url", "https://openrouter.ai/api/v1")),
+                timeout=gen_cfg["timeout"],
                 strict=self.strict_mode,
             )
         else:
             self.web_relevance_judge = OllamaGenerator(
                 web_judge_model,
+                base_url=str(web_judge_cfg.get("ollama_base_url", "")).strip() or None,
+                api_key_env=str(web_judge_cfg.get("api_key_env", "OLLAMA_API_KEY")),
                 strict=self.strict_mode,
+                timeout=gen_cfg["timeout"],
+                max_retries=gen_cfg["max_retries"],
+                retry_backoff_sec=gen_cfg["retry_backoff_sec"],
                 keep_alive=keep_alive,
                 options=ollama_options,
             )
@@ -610,8 +608,25 @@ class WebCrawler:
             config.get("web_validator", {}).get("cross_encoder_local_files_only", False)
         )
         self._cross_encoder = None
+        self._cross_encoder_lock = asyncio.Lock()
         self._tavily_client = TavilyClient(api_key=self.tavily_api_key) if TavilyClient and self.tavily_api_key else None
         self._firecrawl_app = FirecrawlApp(api_key=self.firecrawl_api_key) if FirecrawlApp and self.firecrawl_api_key else None
+
+        # Pre-compute a stable hash of cache-affecting config so cache entries are
+        # invalidated when a user changes domains, thresholds, or providers (B5).
+        md_cfg = dict(crawler_cfg.get("metadata_filtering", {}))
+        cache_key_inputs = {
+            "search_provider": str(crawler_cfg.get("search_provider", "tavily")),
+            "max_urls": int(crawler_cfg.get("max_urls", 5)),
+            "top_results": int(crawler_cfg.get("top_results", 2)),
+            "allowed_domains": sorted(str(x).strip().casefold() for x in md_cfg.get("allowed_domains", [])),
+            "blocked_domains": sorted(str(x).strip().casefold() for x in md_cfg.get("blocked_domains", [])),
+            "min_tavily_metadata_score": float(md_cfg.get("min_tavily_metadata_score", 0.0)),
+            "min_query_overlap": float(md_cfg.get("min_query_overlap", 0.0)),
+        }
+        self._cache_config_digest = hashlib.sha256(
+            json.dumps(cache_key_inputs, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
 
     async def generate_search_query(self, question: str) -> str:
         prompt = (
@@ -1159,10 +1174,14 @@ class WebCrawler:
         if CrossEncoder is None:
             raise RuntimeError("CrossEncoder is required for web reranking but is not installed.")
         if self._cross_encoder is None:
-            self._cross_encoder = CrossEncoder(
-                self.cross_encoder_model,
-                local_files_only=self.cross_encoder_local_files_only,
-            )
+            # Concurrent pipeline runs share this WebCrawler; the lock prevents two
+            # simultaneous loads of the (large) cross-encoder model (B2).
+            async with self._cross_encoder_lock:
+                if self._cross_encoder is None:
+                    self._cross_encoder = CrossEncoder(
+                        self.cross_encoder_model,
+                        local_files_only=self.cross_encoder_local_files_only,
+                    )
         pairs = [[question, str(d.get("text", ""))] for d in docs]
         scores = self._cross_encoder.predict(pairs)
         zipped = list(zip(docs, scores))
@@ -1207,4 +1226,4 @@ class WebCrawler:
 
     def _cache_path(self, question: str) -> Path:
         digest = hashlib.sha256(question.strip().casefold().encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.json"
+        return self.cache_dir / f"{digest}_{self._cache_config_digest}.json"

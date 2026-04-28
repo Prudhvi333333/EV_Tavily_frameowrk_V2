@@ -16,11 +16,23 @@ class PipelineMode(str, Enum):
     RAG_PRETRAINED_WEB = "rag_pretrained_web"
 
 
+def load_generation_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Read runtime.generation.* with sensible defaults for big local models."""
+    gen = dict(config.get("runtime", {}).get("generation", {}) or {})
+    return {
+        "timeout": float(gen.get("timeout_sec", 600.0)),
+        "max_retries": max(0, int(gen.get("max_retries", 3))),
+        "retry_backoff_sec": max(0.1, float(gen.get("retry_backoff_sec", 5.0))),
+        "on_error": str(gen.get("on_error", "skip")).strip().lower(),
+    }
+
+
 class OllamaGenerator:
     def __init__(
         self,
         model: str,
         base_url: str | None = None,
+        api_key_env: str = "OLLAMA_API_KEY",
         timeout: float = 120.0,
         strict: bool = True,
         max_retries: int = 2,
@@ -30,6 +42,8 @@ class OllamaGenerator:
     ) -> None:
         self.model = model
         self.base_url = resolve_ollama_base_url(base_url)
+        self.api_key_env = api_key_env
+        self.api_key = os.getenv(api_key_env, "").strip()
         self.timeout = timeout
         self.strict = strict
         self.max_retries = max(0, int(max_retries))
@@ -39,13 +53,18 @@ class OllamaGenerator:
         self._checked = False
         self._available = False
 
+    def _headers(self) -> dict[str, str]:
+        if self.api_key and "ollama.com" in self.base_url:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
+
     async def _check_availability(self) -> bool:
         if self._checked:
             return self._available
         self._checked = True
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)) as client:
-                resp = await client.get(f"{self.base_url}/api/tags")
+                resp = await client.get(f"{self.base_url}/api/tags", headers=self._headers())
                 if resp.status_code != 200:
                     self._available = False
                     return False
@@ -80,7 +99,7 @@ class OllamaGenerator:
         for attempt in range(self.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=self._headers())
                     resp.raise_for_status()
                 data = resp.json()
                 return str(data.get("response", "")).strip()
@@ -294,19 +313,17 @@ class ModelGenerator:
         self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
         self.ollama_keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
         self.ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
-        if model_key in {"qwen", "gemma"}:
-            self.client = OllamaGenerator(
-                self.model_name,
-                strict=self.strict_mode,
-                keep_alive=self.ollama_keep_alive,
-                options=self.ollama_options,
-            )
-        elif model_key == "gemini":
-            self.client = GeminiGenerator(self.model_name, strict=self.strict_mode)
+        gen_cfg = load_generation_config(config)
+        if model_key == "gemini":
+            self.client = GeminiGenerator(self.model_name, timeout=gen_cfg["timeout"], strict=self.strict_mode)
         else:
+            # qwen, gemma, and any other unknown key route through Ollama.
             self.client = OllamaGenerator(
                 self.model_name,
                 strict=self.strict_mode,
+                timeout=gen_cfg["timeout"],
+                max_retries=gen_cfg["max_retries"],
+                retry_backoff_sec=gen_cfg["retry_backoff_sec"],
                 keep_alive=self.ollama_keep_alive,
                 options=self.ollama_options,
             )

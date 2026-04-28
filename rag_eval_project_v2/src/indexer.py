@@ -16,8 +16,14 @@ from src.utils.config_loader import resolve_path
 from src.utils.logger import get_logger
 
 
+_PREFIX_RE = re.compile(r"^\s*search_(?:query|document)\s*:\s*", re.IGNORECASE)
+
+
 def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+    # Strip nomic instruction prefixes so BM25 doesn't tokenize "search_document" as
+    # a feature term, which would diverge from the embedded content (A6).
+    cleaned = _PREFIX_RE.sub("", str(text or ""))
+    return re.findall(r"[a-z0-9]+", cleaned.lower())
 
 
 @dataclass

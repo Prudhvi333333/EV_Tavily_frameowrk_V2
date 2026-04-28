@@ -53,13 +53,13 @@ def test_hyde_changes_vector(config: dict, monkeypatch: pytest.MonkeyPatch) -> N
 
     expander.embedding_model = FakeEmbedder()
 
-    async def fake_expand(question: str, intent_dict: dict) -> str:
-        return f"Expanded query with additional terms: {question}"
+    async def fake_expand(question: str, intent_dict: dict) -> tuple[str, bool]:
+        return f"Expanded query with additional terms: {question}", True
 
     monkeypatch.setattr(expander, "expand", fake_expand)
-    expanded = asyncio.run(expander.expand(q, intent))
+    expanded, used_hyde = asyncio.run(expander.expand(q, intent))
     v_raw = np.array(expander.get_search_vector(q))
-    v_hyde = np.array(expander.get_search_vector(expanded))
+    v_hyde = np.array(expander.get_search_vector(expanded, is_expansion=used_hyde))
     cosine = float(np.dot(v_raw, v_hyde) / (np.linalg.norm(v_raw) * np.linalg.norm(v_hyde)))
     assert cosine < 0.9999
 
