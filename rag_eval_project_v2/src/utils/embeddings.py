@@ -9,10 +9,19 @@ import numpy as np
 from src.utils.ollama import resolve_ollama_base_url
 
 class SentenceTransformerEmbedder:
-    def __init__(self, model_name: str, local_files_only: bool = True) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        local_files_only: bool = True,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ) -> None:
         from sentence_transformers import SentenceTransformer
 
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name, local_files_only=local_files_only)
+        self.query_prefix = str(query_prefix or "").rstrip()
+        self.document_prefix = str(document_prefix or "").rstrip()
 
     def encode(
         self,
@@ -20,16 +29,12 @@ class SentenceTransformerEmbedder:
         normalize_embeddings: bool = True,
         convert_to_numpy: bool = False,
     ) -> Any:
-        arr = self.model.encode(
-            [texts] if isinstance(texts, str) else texts,
+        return self.encode_with_task(
+            texts,
+            task="generic",
             normalize_embeddings=normalize_embeddings,
-            convert_to_numpy=True,
+            convert_to_numpy=convert_to_numpy,
         )
-        if convert_to_numpy:
-            return arr
-        if isinstance(texts, str):
-            return arr[0].tolist()
-        return arr.tolist()
 
     def encode_with_task(
         self,
@@ -38,13 +43,41 @@ class SentenceTransformerEmbedder:
         normalize_embeddings: bool = True,
         convert_to_numpy: bool = False,
     ) -> Any:
-        # Sentence-transformers models generally do not require task prefixes.
-        _ = task
-        return self.encode(
-            texts,
+        single = isinstance(texts, str)
+        items = [str(texts)] if single else [str(x) for x in list(texts)]
+        items = self._apply_prefix(items, task=task)
+        arr = self.model.encode(
+            items,
             normalize_embeddings=normalize_embeddings,
-            convert_to_numpy=convert_to_numpy,
+            convert_to_numpy=True,
         )
+        if convert_to_numpy:
+            return arr
+        if single:
+            return arr[0].tolist()
+        return arr.tolist()
+
+    def _apply_prefix(self, items: list[str], task: str) -> list[str]:
+        # bge-* and gte-* models use task-specific prefixes; sentence-transformers
+        # does not apply them automatically. We do it here so swapping in bge-large
+        # works without changes elsewhere.
+        task_norm = str(task or "").strip().lower()
+        prefix = ""
+        if task_norm == "query":
+            prefix = self.query_prefix
+        elif task_norm == "document":
+            prefix = self.document_prefix
+        if not prefix:
+            return items
+        prefix_l = prefix.casefold()
+        out: list[str] = []
+        for text in items:
+            stripped = text.lstrip()
+            if stripped.casefold().startswith(prefix_l):
+                out.append(text)
+            else:
+                out.append(f"{prefix} {text}".strip())
+        return out
 
 
 class OllamaEmbedder:
@@ -252,9 +285,27 @@ def load_embedder_from_config(config: dict[str, Any]) -> Any:
             max_retries=max_retries,
             retry_backoff_sec=retry_backoff_sec,
         )
-    if provider == "sentence_transformers":
-        return SentenceTransformerEmbedder(model_name=model_name, local_files_only=local_only)
-    raise ValueError(f"Unsupported embeddings.provider='{provider}'. Use 'ollama' or 'sentence_transformers'.")
+    if provider in {"sentence_transformers", "huggingface"}:
+        # bge-* models expect a query-side instruction prefix and no document prefix.
+        # If the user explicitly configures query/document prefixes via instruction_prefixes
+        # we honor those; otherwise we auto-apply the bge default for known bge models.
+        st_query_prefix = ""
+        st_doc_prefix = ""
+        if prefix_enabled and not only_for_nomic:
+            st_query_prefix = query_prefix
+            st_doc_prefix = document_prefix
+        elif "bge" in str(model_name).casefold():
+            st_query_prefix = "Represent this sentence for searching relevant passages:"
+            st_doc_prefix = ""
+        return SentenceTransformerEmbedder(
+            model_name=model_name,
+            local_files_only=local_only,
+            query_prefix=st_query_prefix,
+            document_prefix=st_doc_prefix,
+        )
+    raise ValueError(
+        f"Unsupported embeddings.provider='{provider}'. Use 'ollama', 'huggingface', or 'sentence_transformers'."
+    )
 
 
 def encode_for_task(

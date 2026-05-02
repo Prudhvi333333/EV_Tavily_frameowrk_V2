@@ -21,6 +21,9 @@ KB_TEXT_FIELDS = [
     "Product / Service",
     "EV / Battery Relevant",
     "Classification Method",
+    # LLM_Description is appended by scripts/enrich_kb.py. When the KB hasn't been
+    # enriched the column is absent and _row_to_text simply skips it.
+    "LLM_Description",
 ]
 
 
@@ -41,6 +44,15 @@ def _row_to_text(row: pd.Series) -> str:
 
 def load_kb(config: dict[str, Any]) -> list[dict[str, Any]]:
     kb_path = resolve_path(config, config["paths"]["kb_input"])
+    # Graceful fallback: config may point at kb_master_enriched.xlsx but enrichment
+    # hasn't been run yet. Fall back to the unenriched original so the pipeline still
+    # works (with weaker retrieval) instead of hard-failing.
+    if not kb_path.exists():
+        fallback = kb_path.parent / "kb_master.xlsx"
+        if fallback.exists():
+            kb_path = fallback
+        else:
+            raise FileNotFoundError(f"KB file not found at {kb_path} and fallback {fallback} also missing.")
     df = pd.read_excel(kb_path)
     documents: list[dict[str, Any]] = []
     for idx, row in df.iterrows():

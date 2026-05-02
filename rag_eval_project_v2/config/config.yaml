@@ -13,7 +13,7 @@ project:
   random_seed: 42
 
 paths:
-  kb_input: data/kb/kb_master.xlsx
+  kb_input: data/kb/kb_master_enriched.xlsx
   questions_input: data/questions/questions_master.xlsx
   train_questions: data/questions/train_questions.xlsx
   test_questions: data/questions/test_questions.xlsx
@@ -47,20 +47,20 @@ split:
   stratify_column: Use Case Category
 
 embeddings:
-  provider: ollama
-  model: nomic-embed-text
+  provider: huggingface
+  model: BAAI/bge-large-en-v1.5
   ollama_base_url: http://localhost:11434
-  local_files_only: true
+  local_files_only: false
   timeout: 420
   keep_alive: 0s
   batch_size: 8
   max_retries: 4
   retry_backoff_sec: 5.0
   recommended_models:
-    quality: nomic-embed-text
+    quality: BAAI/bge-large-en-v1.5
     balanced: sentence-transformers/all-mpnet-base-v2
     fast: sentence-transformers/all-MiniLM-L6-v2
-  cross_encoder_model: cross-encoder/ms-marco-MiniLM-L6-v2
+  cross_encoder_model: BAAI/bge-reranker-v2-m3
   instruction_prefixes:
     enabled: true
     only_for_nomic: true
@@ -69,12 +69,12 @@ embeddings:
 
 retrieval:
   backend: llamaindex
-  top_k: 8
+  top_k: 12
   adaptive_top_k: true
-  max_context_chars: 4200
-  max_doc_chars: 700
-  semantic_weight: 0.7
-  bm25_weight: 0.3
+  max_context_chars: 6000
+  max_doc_chars: 1200
+  semantic_weight: 0.6
+  bm25_weight: 0.4
   metadata_scoring:
     location_match_boost: 0.08
     location_mismatch_penalty: -0.02
@@ -88,18 +88,29 @@ retrieval:
 reranker:
   enabled: true
   provider: cross_encoder
-  model: cross-encoder/ms-marco-MiniLM-L6-v2
-  local_files_only: true
-  max_candidates: 18
-  blend_weight: 0.65
+  model: BAAI/bge-reranker-v2-m3
+  local_files_only: false
+  max_candidates: 24
+  blend_weight: 0.55
 
 hyde:
-  enabled: false
+  enabled: true
   model: qwen2.5:14b
   apply_to_intents:
     - indirect
     - multi_hop
     - comparison
+
+structured_router:
+  enabled: true
+  llm_model: ""             # empty -> defaults to evaluation.judge.model
+  max_rows_in_context: 20
+  fallback_on_parse_error: true
+
+verifier:
+  enabled: true
+  model: ""                 # empty -> defaults to the run's primary generator (e.g. gemma)
+  max_passes: 1
 
 crawler:
   timeout_per_url: 30
@@ -229,4 +240,4 @@ evaluation:
 
 prompting:
   mode: chain_of_thought
-  few_shot_examples: 2
+  few_shot_examples: 5
