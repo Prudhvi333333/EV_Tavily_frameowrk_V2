@@ -8,10 +8,40 @@ import numpy as np
 
 from src.indexer import HybridIndex
 from src.utils.embeddings import encode_for_task
+from src.utils.logger import get_logger
+
+
+# Strip nomic instruction prefixes ("search_query:", "search_document:") before tokenizing
+# so BM25 sees the same surface as the embedder (A6).
+_PREFIX_RE = re.compile(r"^\s*search_(?:query|document)\s*:\s*", re.IGNORECASE)
 
 
 def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+    cleaned = _PREFIX_RE.sub("", str(text or ""))
+    return re.findall(r"[a-z0-9]+", cleaned.lower())
+
+
+# k1 governs how fast bm25 saturates: bm25/(k+bm25). With typical Okapi scores in the
+# 0–10 range, k≈2.0 keeps weak matches near zero while still allowing strong ones.
+_BM25_SATURATION_K = 2.0
+
+
+def _saturate(score: float, k: float = _BM25_SATURATION_K) -> float:
+    if score <= 0.0:
+        return 0.0
+    return float(score) / (float(k) + float(score))
+
+
+def _diminishing_sum(values: list[float]) -> float:
+    # Largest magnitude first, then half-weight the rest so multi-feature mismatches
+    # don't compound to floor and crush semantically relevant docs.
+    if not values:
+        return 0.0
+    ordered = sorted(values, key=lambda v: abs(v), reverse=True)
+    total = float(ordered[0])
+    for v in ordered[1:]:
+        total += 0.5 * float(v)
+    return total
 
 
 @dataclass
@@ -30,6 +60,7 @@ class HybridRetriever:
         self.index = index
         self.config = config
         self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
+        self.logger = get_logger("retriever", config) if config.get("_meta") else None
         self.id_to_doc = {d["id"]: d for d in self.index.documents}
         retrieval_cfg = config.get("retrieval", {})
         self.top_k = int(retrieval_cfg["top_k"])
@@ -52,12 +83,30 @@ class HybridRetriever:
             raise ValueError("retrieval.backend must be one of: hybrid, llamaindex")
 
         self.semantic_backend = None
+        self.active_backend = self.backend
         if self.backend == "llamaindex":
-            from src.llamaindex_backend import LlamaIndexSemanticBackend
+            try:
+                from src.llamaindex_backend import LlamaIndexSemanticBackend
 
-            self.semantic_backend = LlamaIndexSemanticBackend(
-                collection=self.index.collection,
-                strict_mode=self.strict_mode,
+                self.semantic_backend = LlamaIndexSemanticBackend(
+                    collection=self.index.collection,
+                    strict_mode=self.strict_mode,
+                )
+            except Exception as exc:
+                if self.strict_mode:
+                    raise
+                if self.logger is not None:
+                    self.logger.warning(
+                        "LlamaIndex backend requested but unavailable (%s); falling back to hybrid.",
+                        exc,
+                    )
+                self.semantic_backend = None
+                self.active_backend = "hybrid"
+        if self.logger is not None:
+            self.logger.info(
+                "Retriever active backend: %s (configured=%s)",
+                self.active_backend,
+                self.backend,
             )
 
         reranker_cfg = config.get("reranker", {})
@@ -138,14 +187,19 @@ class HybridRetriever:
             doc_text = str(hit.get("text", ""))
             metadata = dict(hit.get("metadata", {}))
             doc_id = str(hit.get("doc_id") or self._find_doc_id(doc_text, metadata))
+            if not doc_id:
+                # Skip hits we can't resolve to an indexed doc; previously misattributed
+                # to documents[0], inflating its retrieval score.
+                continue
             semantic_scores[doc_id] = float(hit.get("similarity", 0.0))
 
         bm25_scores: dict[str, float] = {}
         if question_text.strip():
             raw_scores = self.index.bm25.get_scores(_tokenize(question_text))
-            max_raw = float(np.max(raw_scores)) if len(raw_scores) else 1.0
+            # Saturating normalization: bm25/(k+bm25). Maps weak matches near 0 and
+            # strong matches toward 1, with stable scale across queries (A5).
             for doc, score in zip(self.index.documents, raw_scores):
-                bm25_scores[doc["id"]] = float(score / max(max_raw, 1e-9))
+                bm25_scores[doc["id"]] = _saturate(float(score))
 
         scored: list[RetrievedDoc] = []
         for doc in self.index.documents:
@@ -184,30 +238,37 @@ class HybridRetriever:
         return max(4, base_top_k + boost)
 
     def _metadata_boost(self, metadata: dict[str, Any], intent: dict[str, Any]) -> float:
-        boost = 0.0
         category = str(metadata.get("category", "")).lower()
         role = str(metadata.get("role", "")).lower()
         location = str(metadata.get("location", "")).lower()
         company = str(metadata.get("company", "")).lower()
 
+        positives: list[float] = []
+        negatives: list[float] = []
+
         if intent.get("location_filter"):
             if intent.get("location_value") in location:
-                boost += self.location_match_boost
+                positives.append(self.location_match_boost)
             else:
-                boost += self.location_mismatch_penalty
+                negatives.append(self.location_mismatch_penalty)
         if intent.get("tier_filter"):
             tiers = intent.get("detected_tiers", [])
             if any(t in category for t in tiers):
-                boost += self.tier_match_boost
+                positives.append(self.tier_match_boost)
             else:
-                boost += self.tier_mismatch_penalty
+                negatives.append(self.tier_mismatch_penalty)
         if intent.get("role_filter"):
             role_terms = intent.get("role_terms", [])
             if any(term in role for term in role_terms):
-                boost += self.role_match_boost
+                positives.append(self.role_match_boost)
         if intent.get("oem_filter"):
             if "oem" in category or "oem" in role or "oem" in company:
-                boost += self.oem_match_boost
+                positives.append(self.oem_match_boost)
+
+        # Diminishing returns: stacked penalties/boosts compound at half weight after the
+        # first to avoid suppressing semantically relevant docs that mismatch on multiple
+        # metadata facets at once (A9).
+        boost = _diminishing_sum(positives) + _diminishing_sum(negatives)
         return max(self.max_metadata_penalty, min(boost, self.max_metadata_boost))
 
     def _extract_role_terms(self, q: str) -> list[str]:
@@ -269,9 +330,12 @@ class HybridRetriever:
         out: list[dict[str, Any]] = []
         for doc_text, meta, dist in zip(sem_docs, sem_metas, sem_distances):
             similarity = 1.0 / (1.0 + float(dist))
+            doc_id = self._find_doc_id(str(doc_text), dict(meta or {}))
+            if not doc_id:
+                continue
             out.append(
                 {
-                    "doc_id": self._find_doc_id(str(doc_text), dict(meta or {})),
+                    "doc_id": doc_id,
                     "text": str(doc_text),
                     "metadata": dict(meta or {}),
                     "similarity": similarity,
@@ -284,7 +348,18 @@ class HybridRetriever:
             if d["text"] == doc_text and d["metadata"] == metadata:
                 return d["id"]
         company = (metadata or {}).get("company", "")
-        for d in self.index.documents:
-            if d["metadata"].get("company") == company and company:
-                return d["id"]
-        return self.index.documents[0]["id"]
+        if company:
+            for d in self.index.documents:
+                if d["metadata"].get("company") == company:
+                    return d["id"]
+        # Don't silently return the first doc — that attaches the wrong score to an
+        # unrelated chunk. Raise in strict mode; otherwise log and signal "skip" (A7).
+        msg = (
+            f"Could not resolve doc_id for chunk (text len={len(doc_text)}, "
+            f"company={company!r}); index may be out of sync with the vector store."
+        )
+        if self.strict_mode:
+            raise RuntimeError(msg)
+        if self.logger is not None:
+            self.logger.warning(msg)
+        return ""

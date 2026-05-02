@@ -84,16 +84,15 @@ class CrossEncoderReranker:
 
         order = np.argsort(-scores)
         ranked_pairs = [(pool[int(idx)], float(scores[int(idx)])) for idx in order[:request_k]]
-        raw_scores = np.array([score for _, score in ranked_pairs], dtype=float)
-        min_s = float(raw_scores.min()) if raw_scores.size else 0.0
-        max_s = float(raw_scores.max()) if raw_scores.size else 0.0
-        denom = (max_s - min_s) if max_s > min_s else 1.0
 
+        # Use sigmoid of the raw cross-encoder logit instead of min-max within the pool.
+        # Min-max would force the pool's best to score 1.0 even when the cross-encoder
+        # is uncertain, drowning out the hybrid score (A8). Sigmoid keeps absolute scale.
         out: list[Any] = []
         blend = max(0.0, min(1.0, self.blend_weight))
         for doc, raw_score in ranked_pairs[:request_k]:
-            normalized_rerank = (float(raw_score) - min_s) / denom
-            blended_score = (1.0 - blend) * float(doc.score) + blend * normalized_rerank
+            calibrated = _sigmoid(float(raw_score))
+            blended_score = (1.0 - blend) * float(doc.score) + blend * calibrated
             out.append(
                 replace(
                     doc,
@@ -102,3 +101,12 @@ class CrossEncoderReranker:
                 )
             )
         return out
+
+
+def _sigmoid(x: float) -> float:
+    # Numerically stable sigmoid: cross-encoder logits are typically in [-10, 10].
+    if x >= 0:
+        z = np.exp(-x)
+        return float(1.0 / (1.0 + z))
+    z = np.exp(x)
+    return float(z / (1.0 + z))

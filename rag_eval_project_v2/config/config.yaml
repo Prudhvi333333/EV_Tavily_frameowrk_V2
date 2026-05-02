@@ -1,15 +1,19 @@
 runtime:
   strict_mode: true
   ollama_keep_alive: 0s
-  ollama_options:
-    num_ctx: 4096
+  ollama_options: {}
+  generation:
+    timeout_sec: 600        # 31B-class models can need >120s on long prompts
+    max_retries: 3
+    retry_backoff_sec: 5.0
+    on_error: skip          # 'skip' = log + continue with empty answer; 'fail' = raise
 
 project:
   name: rag_eval_project_v2
   random_seed: 42
 
 paths:
-  kb_input: data/kb/kb_master.xlsx
+  kb_input: data/kb/kb_master_enriched.xlsx
   questions_input: data/questions/questions_master.xlsx
   train_questions: data/questions/train_questions.xlsx
   test_questions: data/questions/test_questions.xlsx
@@ -29,7 +33,7 @@ pipelines:
 models:
   qwen: qwen2.5:14b
   kimi: kimi-k2.5:cloud
-  gemma: gemma3:12b
+  gemma: gemma4:31b-chat
   gemini: gemini-2.5-flash-preview-05-20
 
 run:
@@ -43,20 +47,20 @@ split:
   stratify_column: Use Case Category
 
 embeddings:
-  provider: ollama
-  model: nomic-embed-text
+  provider: huggingface
+  model: BAAI/bge-large-en-v1.5
   ollama_base_url: http://localhost:11434
-  local_files_only: true
+  local_files_only: false
   timeout: 420
   keep_alive: 0s
   batch_size: 8
   max_retries: 4
   retry_backoff_sec: 5.0
   recommended_models:
-    quality: nomic-embed-text
+    quality: BAAI/bge-large-en-v1.5
     balanced: sentence-transformers/all-mpnet-base-v2
     fast: sentence-transformers/all-MiniLM-L6-v2
-  cross_encoder_model: cross-encoder/ms-marco-MiniLM-L6-v2
+  cross_encoder_model: BAAI/bge-reranker-v2-m3
   instruction_prefixes:
     enabled: true
     only_for_nomic: true
@@ -65,12 +69,12 @@ embeddings:
 
 retrieval:
   backend: llamaindex
-  top_k: 8
+  top_k: 12
   adaptive_top_k: true
-  max_context_chars: 4200
-  max_doc_chars: 700
-  semantic_weight: 0.7
-  bm25_weight: 0.3
+  max_context_chars: 6000
+  max_doc_chars: 1200
+  semantic_weight: 0.6
+  bm25_weight: 0.4
   metadata_scoring:
     location_match_boost: 0.08
     location_mismatch_penalty: -0.02
@@ -80,24 +84,33 @@ retrieval:
     oem_match_boost: 0.05
     max_boost: 0.30
     max_penalty: -0.22
-  chunk_strategy: row_only
-  prompt_variant: chain_of_thought
 
 reranker:
   enabled: true
   provider: cross_encoder
-  model: cross-encoder/ms-marco-MiniLM-L6-v2
-  local_files_only: true
-  max_candidates: 18
-  blend_weight: 0.65
+  model: BAAI/bge-reranker-v2-m3
+  local_files_only: false
+  max_candidates: 24
+  blend_weight: 0.55
 
 hyde:
-  enabled: false
+  enabled: true
   model: qwen2.5:14b
   apply_to_intents:
     - indirect
     - multi_hop
     - comparison
+
+structured_router:
+  enabled: true
+  llm_model: ""             # empty -> defaults to evaluation.judge.model
+  max_rows_in_context: 20
+  fallback_on_parse_error: true
+
+verifier:
+  enabled: true
+  model: ""                 # empty -> defaults to the run's primary generator (e.g. gemma)
+  max_passes: 1
 
 crawler:
   timeout_per_url: 30
@@ -113,7 +126,6 @@ crawler:
   max_web_context_chars: 3200
   cache_enabled: true
   search_provider: tavily
-  crawl_provider: firecrawl
   tavily_api_key_env: TAVILY_API_KEY
   firecrawl_api_key_env: FIRECRAWL_API_KEY
   tavily_answer_fallback:
@@ -144,8 +156,9 @@ web_validator:
   judge:
     provider: ollama
     model: kimi-k2.5:cloud
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
   signal_weights:
     - 0.40
     - 0.35
@@ -190,14 +203,15 @@ evaluation:
   judge:
     provider: ollama
     model: kimi-k2.5:cloud
-    ollama_base_url: http://localhost:11434
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
   validator:
     provider: ollama
     model: kimi-k2.5:cloud
+    ollama_base_url: https://ollama.com
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
+    api_key_env: OLLAMA_API_KEY
     flag_threshold: 0.3
   weights_rag:
     faithfulness: 0.25
@@ -226,4 +240,4 @@ evaluation:
 
 prompting:
   mode: chain_of_thought
-  few_shot_examples: 2
+  few_shot_examples: 5

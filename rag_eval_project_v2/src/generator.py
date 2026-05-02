@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from enum import Enum
 from typing import Any
 
@@ -16,11 +17,23 @@ class PipelineMode(str, Enum):
     RAG_PRETRAINED_WEB = "rag_pretrained_web"
 
 
+def load_generation_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Read runtime.generation.* with sensible defaults for big local models."""
+    gen = dict(config.get("runtime", {}).get("generation", {}) or {})
+    return {
+        "timeout": float(gen.get("timeout_sec", 600.0)),
+        "max_retries": max(0, int(gen.get("max_retries", 3))),
+        "retry_backoff_sec": max(0.1, float(gen.get("retry_backoff_sec", 5.0))),
+        "on_error": str(gen.get("on_error", "skip")).strip().lower(),
+    }
+
+
 class OllamaGenerator:
     def __init__(
         self,
         model: str,
         base_url: str | None = None,
+        api_key_env: str = "OLLAMA_API_KEY",
         timeout: float = 120.0,
         strict: bool = True,
         max_retries: int = 2,
@@ -30,6 +43,8 @@ class OllamaGenerator:
     ) -> None:
         self.model = model
         self.base_url = resolve_ollama_base_url(base_url)
+        self.api_key_env = api_key_env
+        self.api_key = os.getenv(api_key_env, "").strip()
         self.timeout = timeout
         self.strict = strict
         self.max_retries = max(0, int(max_retries))
@@ -39,13 +54,18 @@ class OllamaGenerator:
         self._checked = False
         self._available = False
 
+    def _headers(self) -> dict[str, str]:
+        if self.api_key and "ollama.com" in self.base_url:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
+
     async def _check_availability(self) -> bool:
         if self._checked:
             return self._available
         self._checked = True
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)) as client:
-                resp = await client.get(f"{self.base_url}/api/tags")
+                resp = await client.get(f"{self.base_url}/api/tags", headers=self._headers())
                 if resp.status_code != 200:
                     self._available = False
                     return False
@@ -80,7 +100,7 @@ class OllamaGenerator:
         for attempt in range(self.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=self._headers())
                     resp.raise_for_status()
                 data = resp.json()
                 return str(data.get("response", "")).strip()
@@ -198,6 +218,30 @@ class OpenRouterGenerator:
             return ""
 
 
+_GROUND_RULES = (
+    "Answer rules:\n"
+    "1. If the question asks for a list, names, or a count, respond as a numbered list "
+    "with one entity per line and end with a single line: 'Total: N'.\n"
+    "2. Do NOT claim 'no entities exist' or 'none found' unless the context explicitly "
+    "says so. If the context lacks the answer, write exactly: "
+    "'Insufficient context to answer with confidence.'\n"
+    "3. Stay strictly grounded in the context. Do not invent companies, OEM links, "
+    "tier classifications, or employment numbers that are not in the context.\n"
+    "4. Use crisp factual language; no hedging filler."
+)
+
+_STRUCTURED_KB_RULES = (
+    "STRUCTURED_KB rules: the context below is the COMPLETE and AUTHORITATIVE set of "
+    "matching rows from the knowledge base. You MUST enumerate exactly the rows shown. "
+    "Do NOT add entities that are not present and do NOT skip any of the provided rows. "
+    "If matched=0, the correct answer is that no KB rows satisfy the filters."
+)
+
+
+def _has_structured_kb(context: str) -> bool:
+    return "[STRUCTURED_KB]" in (context or "")
+
+
 def build_prompt(
     question: str,
     mode: PipelineMode,
@@ -207,26 +251,28 @@ def build_prompt(
     prompt_mode: str = "chain_of_thought",
 ) -> tuple[str, str]:
     reasoning_line = {
-        "standard": (
-            "Use crisp factual language and avoid filler."
-        ),
+        "standard": "Use crisp factual language and avoid filler.",
         "chain_of_thought": (
-            "Think step-by-step internally and then provide only the final answer."
+            "Think step-by-step internally inside <think>...</think> tags, then write the "
+            "final answer AFTER the closing </think> tag. The final answer must follow the "
+            "answer rules and contain no reasoning trace."
         ),
-        "few_shot": (
-            "Use the examples to match answer style and structure. Stay grounded and concise."
-        ),
+        "few_shot": "Use the examples to match answer style and structure. Stay grounded and concise.",
     }.get(prompt_mode, "Answer with grounded, concise statements.")
 
     examples_block = f"{few_shot_examples}\n\n" if few_shot_examples else ""
+    structured = _has_structured_kb(kb_context)
 
     if mode == PipelineMode.RAG:
-        system = (
-            "You are a data analyst for Georgia's EV supply chain.\n"
-            "Use provided context as the main evidence source.\n"
-            "If context is incomplete, still provide the best possible answer and clearly mark uncertain parts.\n"
-            f"{reasoning_line}"
-        )
+        sys_lines = [
+            "You are a data analyst for Georgia's EV automotive supply chain.",
+            "Answer ONLY from the provided KB context. If the context does not contain the "
+            "facts needed, do not draw on outside knowledge.",
+        ]
+        if structured:
+            sys_lines.append(_STRUCTURED_KB_RULES)
+        sys_lines.extend([_GROUND_RULES, reasoning_line])
+        system = "\n".join(sys_lines)
         user = (
             f"{examples_block}"
             "Context:\n"
@@ -237,25 +283,32 @@ def build_prompt(
         return system, user
 
     if mode == PipelineMode.NO_RAG:
+        # No-RAG has no context to ground in, so 'Insufficient context' rule does not apply.
+        # Keep the strict list-format rule and the no-fabricated-absence rule (so the model
+        # doesn't hallucinate that no entities exist when it actually doesn't know).
         system = (
-            "You are an automotive supply chain expert.\n"
-            "Answer from pretrained knowledge only.\n"
-            "Always provide a direct, best-effort answer to the question.\n"
-            "For list questions, provide a structured list with company, role, and product/service.\n"
-            "If some details are uncertain, provide the most likely answer and state uncertainty briefly.\n"
+            "You are an automotive supply chain expert answering from pretrained knowledge.\n"
+            "Always provide your best-effort, specific answer with named entities where possible.\n"
+            "Do NOT respond 'no companies exist' or 'none' unless you are certain. If you are "
+            "uncertain, give your best guess and briefly state uncertainty.\n"
+            "When the question asks for a list or count, output a numbered list and end with "
+            "'Total: N'.\n"
             f"{reasoning_line}"
         )
         user = f"{examples_block}Question: {question}\nAnswer:"
         return system, user
 
     if mode == PipelineMode.RAG_PRETRAINED:
-        system = (
-            "You are an EV supply chain analyst.\n"
-            "Use context as the primary source and pretrained knowledge only to fill gaps.\n"
-            "Do not fabricate facts not supported by context or clearly stated as background knowledge.\n"
-            "When useful, mention whether a claim comes from context or general knowledge in natural language.\n"
-            f"{reasoning_line}"
-        )
+        sys_lines = [
+            "You are an EV supply chain analyst.",
+            "Prefer the KB context as the source of truth. Pretrained knowledge may ONLY be "
+            "used to clarify well-known background facts (e.g. what 'Tier 1' means); never to "
+            "introduce new entities, OEM links, or numeric values not in the context.",
+        ]
+        if structured:
+            sys_lines.append(_STRUCTURED_KB_RULES)
+        sys_lines.extend([_GROUND_RULES, reasoning_line])
+        system = "\n".join(sys_lines)
         user = (
             f"{examples_block}"
             "Context:\n"
@@ -265,13 +318,16 @@ def build_prompt(
         )
         return system, user
 
-    system = (
-        "You are an EV research analyst with three sources.\n"
-        "Prioritize sources in this order: KB context, then web context, then pretrained knowledge.\n"
-        "When sources conflict, prefer KB and mention the conflict briefly.\n"
-        "If web context is empty, continue with KB and pretrained knowledge without fabricating web claims.\n"
-        f"{reasoning_line}"
-    )
+    sys_lines = [
+        "You are an EV research analyst with KB and web sources.",
+        "Source priority: KB context > web context > pretrained background. Prefer KB on "
+        "any conflict and briefly note the conflict.",
+        "If web context is empty, continue with KB only and do not fabricate web claims.",
+    ]
+    if structured:
+        sys_lines.append(_STRUCTURED_KB_RULES)
+    sys_lines.extend([_GROUND_RULES, reasoning_line])
+    system = "\n".join(sys_lines)
     user = (
         f"{examples_block}"
         "KB Context:\n"
@@ -294,19 +350,17 @@ class ModelGenerator:
         self.strict_mode = bool(config.get("runtime", {}).get("strict_mode", False))
         self.ollama_keep_alive = str(config.get("runtime", {}).get("ollama_keep_alive", "0s"))
         self.ollama_options = dict(config.get("runtime", {}).get("ollama_options", {}))
-        if model_key in {"qwen", "gemma"}:
-            self.client = OllamaGenerator(
-                self.model_name,
-                strict=self.strict_mode,
-                keep_alive=self.ollama_keep_alive,
-                options=self.ollama_options,
-            )
-        elif model_key == "gemini":
-            self.client = GeminiGenerator(self.model_name, strict=self.strict_mode)
+        gen_cfg = load_generation_config(config)
+        if model_key == "gemini":
+            self.client = GeminiGenerator(self.model_name, timeout=gen_cfg["timeout"], strict=self.strict_mode)
         else:
+            # qwen, gemma, and any other unknown key route through Ollama.
             self.client = OllamaGenerator(
                 self.model_name,
                 strict=self.strict_mode,
+                timeout=gen_cfg["timeout"],
+                max_retries=gen_cfg["max_retries"],
+                retry_backoff_sec=gen_cfg["retry_backoff_sec"],
                 keep_alive=self.ollama_keep_alive,
                 options=self.ollama_options,
             )
@@ -331,5 +385,25 @@ class ModelGenerator:
             prompt_mode=self.prompt_mode,
         )
         if isinstance(self.client, OllamaGenerator):
-            return await self.client.generate(prompt=user, system=system)
-        return await self.client.generate(prompt=user, system=system)
+            raw = await self.client.generate(prompt=user, system=system)
+        else:
+            raw = await self.client.generate(prompt=user, system=system)
+        return strip_reasoning(raw)
+
+
+_THINK_BLOCK_RE = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", re.IGNORECASE | re.DOTALL)
+_DANGLING_THINK_RE = re.compile(r"<\s*think\s*>.*", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove <think>...</think> reasoning traces so the judge sees only the final answer.
+
+    Models occasionally emit an unclosed <think> tag (truncation or missing close);
+    in that case we drop everything from the opening tag onward, on the assumption
+    that the final answer would have followed the close tag we never saw.
+    """
+    if not text:
+        return ""
+    cleaned = _THINK_BLOCK_RE.sub("", str(text))
+    cleaned = _DANGLING_THINK_RE.sub("", cleaned)
+    return cleaned.strip()

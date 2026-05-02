@@ -14,6 +14,7 @@ class ScoreValidator:
         validator_cfg = config.get("evaluation", {}).get("validator", {})
         self.provider = str(validator_cfg.get("provider", "ollama")).lower()
         self.model = validator_cfg.get("model", "qwen2.5:14b")
+        self.ollama_base_url = str(validator_cfg.get("ollama_base_url", "")).strip() or None
         self.base_url = str(validator_cfg.get("base_url", "https://openrouter.ai/api/v1")).rstrip("/")
         self.api_key_env = str(validator_cfg.get("api_key_env", "OPENROUTER_API_KEY"))
         self.flag_threshold = float(validator_cfg.get("flag_threshold", 0.3))
@@ -29,6 +30,8 @@ class ScoreValidator:
         else:
             self.local_qwen = OllamaGenerator(
                 self.model,
+                base_url=self.ollama_base_url,
+                api_key_env=self.api_key_env,
                 strict=bool(config.get("runtime", {}).get("strict_mode", False)),
                 keep_alive=keep_alive,
                 options=ollama_options,
